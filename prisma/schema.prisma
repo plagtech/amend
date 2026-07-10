@@ -1,0 +1,89 @@
+// Amend — Shopify Bulk Product Editor
+// Prisma schema. Learn more: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Postgres on Railway. Local dev also points at a Postgres instance via DATABASE_URL.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Session table required by @shopify/shopify-app-session-storage-prisma.
+// Do not remove or rename fields — the library manages this shape.
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model Shop {
+  id            String    @id                  // shop domain, e.g. my-store.myshopify.com
+  plan          String    @default("free")     // free | pro (advanced reserved for v1.1)
+  jobsThisMonth Int       @default(0)
+  cycleStart    DateTime  @default(now())      // job counter resets at cycleStart + 30 days
+  active        Boolean   @default(true)       // set false on app/uninstalled
+  uninstalledAt DateTime?
+  createdAt     DateTime  @default(now())
+}
+
+model EditJob {
+  id           String     @id @default(cuid())
+  shopId       String
+  name         String                          // auto: "Price -10% on Summer collection"
+  filterJson   Json                            // the SELECT criteria
+  actionsJson  Json                            // ordered list of edit actions
+  status       String     @default("draft")    // draft|previewing|snapshotting|running|completed|failed|undone
+  scheduledFor DateTime?
+  revertAt     DateTime?                        // optional auto-revert (sale windows)
+  totalItems   Int        @default(0)
+  failedItems  Int        @default(0)
+  bulkOpGid    String?                          // Shopify bulk operation ID
+  undoOfJobId  String?                          // set if this job is an undo
+  createdAt    DateTime   @default(now())
+  completedAt  DateTime?
+  snapshots    Snapshot[]
+
+  @@index([shopId])
+}
+
+model Snapshot {
+  id        String  @id @default(cuid())
+  jobId     String
+  ownerGid  String  // product or variant GID
+  fieldPath String  // e.g. "variant.price", "product.tags"
+  oldValue  String  // JSON-encoded
+  newValue  String
+  applied   Boolean @default(false)
+  error     String?
+  job       EditJob @relation(fields: [jobId], references: [id])
+
+  @@index([jobId])
+}
+
+model SavedTemplate {
+  id          String   @id @default(cuid())
+  shopId      String
+  name        String
+  filterJson  Json
+  actionsJson Json
+  createdAt   DateTime @default(now())
+
+  @@index([shopId])
+}
