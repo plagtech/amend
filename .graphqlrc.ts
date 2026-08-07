@@ -8,7 +8,7 @@ function getConfig() {
     projects: {
       default: shopifyApiProject({
         apiType: ApiType.Admin,
-        apiVersion: ApiVersion.July25,
+        apiVersion: ApiVersion.July26,
         documents: [
           "./app/**/*.{js,ts,jsx,tsx}",
           "./app/.server/**/*.{js,ts,jsx,tsx}",

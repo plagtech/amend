@@ -14,15 +14,23 @@ See [`Spec.md`](./Spec.md) for the full product/build specification.
 
 **Phase 1 (Scaffold) — complete.** The app scaffolds, builds, and type-checks.
 GDPR + uninstall webhooks are wired. Prisma is on Postgres with the full data
-model. Remaining phases (Select → Edit → Preview → Apply → Undo, billing) are
-tracked in `Spec.md` §9.
+model.
+
+**Phase 2 (Select) — complete.** `/app/edit/new` filters the catalog by
+collection, vendor, product type, tag, status, price, inventory, SKU, and free
+text; toggles between product and variant rows; pages with cursors; and
+supports "select all matching filter" across pages. A seed script builds a
+realistic 1,000-product test catalog.
+
+Remaining phases (Edit → Preview → Apply → Undo, billing) are tracked in
+`Spec.md` §9.
 
 ## Tech stack
 
 - **Framework:** Shopify Remix app template (TypeScript)
 - **UI:** Polaris web components + App Bridge
 - **DB:** Postgres via Prisma (`prisma/schema.prisma`)
-- **Admin API:** GraphQL Admin API `2025-07`
+- **Admin API:** GraphQL Admin API `2026-07`
 - **Scopes:** `read_products`, `write_products` (minimal)
 - **Hosting:** Railway (Dockerfile + `railway.json`)
 
@@ -60,6 +68,34 @@ loads.
 See [`.env.example`](./.env.example). `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`,
 and `SHOPIFY_APP_URL` are injected by the Shopify CLI during `npm run dev`; you
 must supply `DATABASE_URL` (Postgres) yourself.
+
+## Seeding a test catalog
+
+`scripts/seed-products.ts` fills a **development store** with 1,000 products /
+3,000 variants spread across 8 collections, 8 vendors, 10 product types, 12
+tags, three statuses, and a $5–$480 price range — enough for every filter to
+have something to bite on. `Summer Sale` lands at ~301 products, which is the
+collection the `Spec.md` §9 acceptance test runs against.
+
+Mint a token in the dev store (Settings → Apps and sales channels → Develop
+apps → create an app with `read_products` + `write_products` → install → copy
+the Admin API access token), then add to `.env`:
+
+```shell
+SEED_SHOP_DOMAIN=your-store.myshopify.com
+SEED_ADMIN_TOKEN=shpat_xxxxxxxx
+```
+
+```shell
+npm run seed -- --dry-run     # generate offline, print the distribution
+npm run seed                  # create 1,000 products (~10-15 min, rate-limited)
+npm run seed -- --count 50    # a smaller catalog
+npm run seed -- --destroy     # remove everything the script created
+```
+
+The catalog is generated from a fixed PRNG seed, so repeated runs produce the
+same products. Everything it creates is tagged `amend-seed`, and `--destroy`
+matches on that tag — it will never delete products it didn't make.
 
 ## Deploying to Railway
 
