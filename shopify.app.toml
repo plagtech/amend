@@ -1,27 +1,16 @@
-# This file stores configurations for your Shopify app.
-# Run `shopify app config link` to associate it with a Partner-dashboard app
-# (this fills in client_id, application_url, and the [auth]/[build] sections).
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-name = "Amend - Bulk Product Editor"
-handle = "amend"
-client_id = ""
-application_url = "https://example.com"
+client_id = "cf910c1665cd705b068ebac7863b1966"
+name = "Amend"
+application_url = "https://shopify.dev/apps/default-app-home"
 embedded = true
 
-[access_scopes]
-# Minimal scopes = faster review. Amend only reads and writes products.
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_products,write_products"
-
-[auth]
-redirect_urls = [
-  "https://example.com/auth/callback",
-  "https://example.com/auth/shopify/callback",
-  "https://example.com/api/auth/callback"
-]
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
 
 [webhooks]
-api_version = "2026-07"
+api_version = "2026-10"
 
   # Handled by: /app/routes/webhooks.app.uninstalled.tsx
   [[webhooks.subscriptions]]
@@ -30,8 +19,8 @@ api_version = "2026-07"
 
   # Handled by: /app/routes/webhooks.app.scopes_update.tsx
   [[webhooks.subscriptions]]
-  topics = ["app/scopes_update"]
   uri = "/webhooks/app/scopes_update"
+  topics = ["app/scopes_update"]
 
   # Mandatory GDPR compliance webhooks (public apps).
   # See: https://shopify.dev/docs/apps/build/privacy-law-compliance
@@ -50,5 +39,9 @@ api_version = "2026-07"
   uri = "/webhooks/shop/redact"
   compliance_topics = ["shop/redact"]
 
-[pos]
-embedded = false
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_products,write_products"
+
+[auth]
+redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]

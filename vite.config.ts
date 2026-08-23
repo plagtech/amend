@@ -43,6 +43,11 @@ export default defineConfig({
     cors: {
       preflightContinue: true,
     },
+    // Bind IPv4 explicitly. Vite's default host is "localhost", which Node
+    // resolves to ::1 on Windows, so Vite listens on IPv6 loopback only. The
+    // Shopify CLI proxy dials 127.0.0.1 and gets ECONNREFUSED, which surfaces
+    // as "App hasn't started in time, giving up" and a dead tunnel.
+    host: "127.0.0.1",
     port: Number(process.env.PORT || 3000),
     hmr: hmrConfig,
     fs: {
