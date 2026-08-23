@@ -22,8 +22,19 @@ text; toggles between product and variant rows; pages with cursors; and
 supports "select all matching filter" across pages. A seed script builds a
 realistic 1,000-product test catalog.
 
-Remaining phases (Edit → Preview → Apply → Undo, billing) are tracked in
-`Spec.md` §9.
+**Phase 3 (Edit + Preview) — complete.** Stackable edit actions (price, tags,
+status) with server-computed before → after diffs, a per-row exclude checkbox,
+and a summary of exactly what will change. Nothing writes until Apply.
+
+**Phase 4 (Apply + Undo) — complete.** Jobs snapshot every value they are about
+to overwrite *before* the first mutation runs, then apply — inline for small
+edits, via Bulk Operations above 100 line-items — and undo restores the
+snapshot as a job of its own. One job runs per shop at a time; the rest queue.
+Jobs are resumable, so a crashed worker picks up where it stopped without
+double-applying. See [The job engine](#the-job-engine).
+
+Remaining phases (the rest of the edit actions, templates, billing) are tracked
+in `Spec.md` §9.
 
 ## Tech stack
 
@@ -97,6 +108,51 @@ The catalog is generated from a fixed PRNG seed, so repeated runs produce the
 same products. Everything it creates is tagged `amend-seed`, and `--destroy`
 matches on that tag — it will never delete products it didn't make.
 
+## The job engine
+
+`app/lib/apply.server.ts` is the whole of APPLY and UNDO. The rule it exists to
+enforce, and the one every design decision in it serves:
+
+> **No mutation runs until 100% of the job's snapshots are persisted.**
+
+That is structural, not a convention. The snapshot write and the
+`snapshotting → running` transition are one database transaction, and the
+mutation phase refuses to send anything for a job that is not `running` with a
+snapshot count matching `totalItems`. There is no state in which the catalog
+has changed and the before-picture is incomplete.
+
+| Concern | Where | Note |
+|---|---|---|
+| Before-values | `snapshots.server.ts` | APPLY re-resolves the selection server-side through `buildPreview`, so the diff a merchant approved and the values written are produced by the same code. UNDO reads the *live* value, which is how drift gets flagged. |
+| Mutation building | `mutations.ts` | Pure. The inline and bulk paths send byte-identical variables and differ only in delivery. |
+| Small jobs (≤100 rows) | `runInline` | Batched mutations, 10 variants per call, cost-aware rate limiting in `throttle.server.ts`. |
+| Large jobs | `bulk.server.ts` | Staged JSONL upload → `bulkOperationRunMutation`, one stage per mutation type. Results are matched back to rows by `__lineNumber`. |
+| Completion | `webhooks.bulk_operations.finish.tsx` | No polling. A missed delivery is caught by the stale sweep, which reconciles by reading the operation. |
+| Resume | `Snapshot.applied` + `EditJob.heartbeatAt` | Per-row state, so a resume never re-applies what already landed. |
+| Concurrency | `claimRunSlot` | A serializable transaction. Two Apply clicks cannot both start. |
+
+Undo is free on every plan and never consumes a job credit — SPEC §7.
+
+## Verification
+
+Two scripts check the app against a real seeded store rather than against
+mocks. Both need `SEED_SHOP_DOMAIN` and `SEED_ADMIN_TOKEN`; `verify:apply`
+also needs `DATABASE_URL`.
+
+```bash
+npm run verify:filters          # filter counts + diff arithmetic vs the seed's PRNG
+npm run verify:apply            # a real edit + undo, inline path (~6 products)
+npm run verify:apply -- --bulk  # the same, through Bulk Operations (~100 products)
+```
+
+`verify:apply` drives the real engine — the same `createApplyJob` / `runJob` /
+`createUndoJob` the routes call — and reads the store back from Shopify before
+the edit, after the edit, and after the undo. It asserts the catalog ends up
+byte-for-byte where it started, that per-row exclusions and unselected products
+were left alone, and that a job with an incomplete snapshot refuses to write at
+all. It writes to the store and reverses itself, so point it at a dev store
+only; the job rows it creates are cleaned up on the way out.
+
 ## Deploying to Railway
 
 1. Create a Railway project and add a **Postgres** plugin.
@@ -113,8 +169,9 @@ matches on that tag — it will never delete products it didn't make.
 ## Data model
 
 `prisma/schema.prisma` defines `Session` (Shopify), `Shop`, `EditJob`,
-`Snapshot`, and `SavedTemplate` per `Spec.md` §4. The initial Postgres
-migration is `prisma/migrations/0_init`.
+`Snapshot`, and `SavedTemplate` per `Spec.md` §4, plus the columns the job
+engine needs on the last two (delivery mode, bulk stage, heartbeat, per-row
+applied/error/drift). Migrations: `prisma/migrations/`.
 
 ## Webhooks
 
@@ -122,6 +179,7 @@ migration is `prisma/migrations/0_init`.
 |---|---|---|
 | `app/uninstalled` | `webhooks.app.uninstalled.tsx` | Delete sessions, mark shop inactive |
 | `app/scopes_update` | `webhooks.app.scopes_update.tsx` | Update stored scope |
+| `bulk_operations/finish` | `webhooks.bulk_operations.finish.tsx` | Settle a job's bulk stage and start the next |
 | `customers/data_request` | `webhooks.customers.data_request.tsx` | 200 (no customer data stored) |
 | `customers/redact` | `webhooks.customers.redact.tsx` | 200 (no customer data stored) |
 | `shop/redact` | `webhooks.shop.redact.tsx` | Delete all shop data |

@@ -285,8 +285,18 @@ export interface PreviewDiff {
   /** Matches `Snapshot.fieldPath` — e.g. "variant.price", "product.tags". */
   fieldPath: string;
   label: string;
+  /** Human-readable, for the diff table. Lossy on purpose (null renders "—"). */
   before: string;
   after: string;
+  /**
+   * The same two values JSON-encoded, losslessly. This is what `Snapshot`
+   * persists and what the mutation builder decodes and sends, so the numbers a
+   * merchant approved in the preview are the exact bytes that reach Shopify —
+   * a tag containing ", " or an absent compare-at price survives the round trip
+   * where the display strings above would not.
+   */
+  rawBefore: string;
+  rawAfter: string;
 }
 
 export interface PreviewRow {
@@ -347,6 +357,8 @@ export function productDiffs(
       label: "Tags",
       before: product.tags.join(", ") || "—",
       after: tags.join(", ") || "—",
+      rawBefore: JSON.stringify(product.tags),
+      rawAfter: JSON.stringify(tags),
     });
   }
   if (status !== product.status) {
@@ -355,6 +367,8 @@ export function productDiffs(
       label: "Status",
       before: product.status,
       after: status,
+      rawBefore: JSON.stringify(product.status),
+      rawAfter: JSON.stringify(status),
     });
   }
   return diffs;
@@ -383,6 +397,8 @@ export function variantDiffs(
       label: PRICE_LABEL.price,
       before: variant.price,
       after: price,
+      rawBefore: JSON.stringify(variant.price),
+      rawAfter: JSON.stringify(price),
     });
   }
   if (!sameMoney(variant.compareAtPrice, compareAt)) {
@@ -391,6 +407,8 @@ export function variantDiffs(
       label: PRICE_LABEL.compareAtPrice,
       before: variant.compareAtPrice ?? "—",
       after: compareAt ?? "—",
+      rawBefore: JSON.stringify(variant.compareAtPrice),
+      rawAfter: JSON.stringify(compareAt),
     });
   }
   return diffs;

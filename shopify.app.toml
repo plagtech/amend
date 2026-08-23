@@ -21,6 +21,12 @@ api_version = "2026-07"
   uri = "/webhooks/app/uninstalled"
   topics = ["app/uninstalled"]
 
+  # Completion signal for every job that runs through Bulk Operations.
+  # Handled by: /app/routes/webhooks.bulk_operations.finish.tsx
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/bulk_operations/finish"
+  topics = ["bulk_operations/finish"]
+
   # Handled by: /app/routes/webhooks.app.scopes_update.tsx
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"

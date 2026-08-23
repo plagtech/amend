@@ -36,6 +36,13 @@ export interface BuildPreviewArgs {
   selection: Selection;
   sortKey: SortKey;
   reverse: boolean;
+  /**
+   * Changed rows to return. Defaults to `PREVIEW_ROW_LIMIT`, which is what the
+   * browser can usefully render. APPLY passes `Infinity`: a snapshot has to
+   * cover every affected row or undo would restore only part of the catalog,
+   * and a truncated row list is exactly how that bug would happen.
+   */
+  rowLimit?: number;
 }
 
 export interface PreviewResult {
@@ -73,7 +80,14 @@ export const EMPTY_PREVIEW: PreviewResult = {
 
 export async function buildPreview(
   admin: AdminApiContext,
-  { filters, actions, selection, sortKey, reverse }: BuildPreviewArgs,
+  {
+    filters,
+    actions,
+    selection,
+    sortKey,
+    reverse,
+    rowLimit = PREVIEW_ROW_LIMIT,
+  }: BuildPreviewArgs,
 ): Promise<PreviewResult> {
   const live = actions.filter(isActionComplete);
   if (!live.length) return EMPTY_PREVIEW;
@@ -120,7 +134,7 @@ export async function buildPreview(
     for (const row of produced) {
       if (row.kind === "variant") variantsChanged += 1;
       totalRows += 1;
-      if (rows.length < PREVIEW_ROW_LIMIT) rows.push(row);
+      if (rows.length < rowLimit) rows.push(row);
     }
   }
 

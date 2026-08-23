@@ -49,7 +49,7 @@ model EditJob {
   name         String                          // auto: "Price -10% on Summer collection"
   filterJson   Json                            // the SELECT criteria
   actionsJson  Json                            // ordered list of edit actions
-  status       String     @default("draft")    // draft|previewing|snapshotting|running|completed|failed|undone
+  status       String     @default("draft")    // draft|queued|snapshotting|running|completed|failed|undone
   scheduledFor DateTime?
   revertAt     DateTime?                        // optional auto-revert (sale windows)
   totalItems   Int        @default(0)
@@ -60,7 +60,22 @@ model EditJob {
   completedAt  DateTime?
   snapshots    Snapshot[]
 
+  // --- Phase 4: the job engine ---------------------------------------------
+  // How the mutations run. "sync" batches them inline; "bulk" stages a JSONL
+  // upload and waits on the bulk_operations/finish webhook.
+  mode         String     @default("sync")     // sync|bulk
+  // Bulk runs one mutation type at a time, so a job with both variant and
+  // product edits runs two sequential bulk operations. This is the one in
+  // flight — see MUTATION_STAGES in app/lib/mutations.ts.
+  stage        String?                          // variant|product
+  startedAt    DateTime?
+  // Touched while a job is actively mutating. A running job whose heartbeat has
+  // gone cold is a crashed worker, and is safe to resume.
+  heartbeatAt  DateTime?
+  error        String?                          // job-level failure message
+
   @@index([shopId])
+  @@index([shopId, status])
 }
 
 model Snapshot {
@@ -74,7 +89,20 @@ model Snapshot {
   error     String?
   job       EditJob @relation(fields: [jobId], references: [id])
 
+  // Parent product of a variant row. productVariantsBulkUpdate is addressed by
+  // product, so the mutation builder needs this and must not have to re-query
+  // Shopify for it mid-apply.
+  productGid String?
+  // Line this row occupies in the JSONL of the current bulk stage. Bulk results
+  // come back keyed by __lineNumber, so this is how a result finds its row.
+  bulkLine   Int?
+  // Undo only: the live value no longer matched what the original job wrote,
+  // i.e. the product was edited elsewhere in between. The undo still applies.
+  drifted    Boolean   @default(false)
+  appliedAt  DateTime?
+
   @@index([jobId])
+  @@index([jobId, applied])
 }
 
 model SavedTemplate {

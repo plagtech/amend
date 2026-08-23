@@ -3,6 +3,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
   useFetcher,
   useLoaderData,
+  useNavigate,
   useNavigation,
   useSearchParams,
 } from "@remix-run/react";
@@ -23,6 +24,8 @@ import {
   IndexTableSelectionType,
   InlineStack,
   Layout,
+  List,
+  Modal,
   Page,
   Popover,
   Select,
@@ -36,6 +39,13 @@ import { ImageIcon, PlusIcon } from "@shopify/polaris-icons";
 import { TitleBar } from "@shopify/app-bridge-react";
 
 import { authenticate } from "../shopify.server";
+import {
+  JobRequestError,
+  PlanLimitError,
+  createApplyJob,
+  runJobDetached,
+} from "../lib/apply.server";
+import { describeActions, jobName } from "../lib/jobs";
 import {
   coerceSelection,
   selectionSignature,
@@ -51,6 +61,7 @@ import {
 } from "../lib/actions";
 import type { PreviewResult } from "../lib/preview.server";
 import { buildPreview } from "../lib/preview.server";
+import type { JobScope } from "../lib/snapshots.server";
 import type { ProductStatus, SelectFilters, SelectView } from "../lib/filters";
 import {
   PRODUCT_STATUSES,
@@ -103,36 +114,77 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   };
 };
 
+/** What the Apply branch of the action hands back to the browser. */
+export interface ApplyResponse {
+  jobId: string | null;
+  error: string | null;
+}
+
 /**
- * Preview endpoint. POSTed to rather than folded into the loader because the
+ * Preview and Apply. Both POSTed rather than folded into the loader because the
  * selection can be thousands of ids — that belongs in a body, not a URL — and
- * because previewing is an explicit, comparatively expensive step the merchant
- * asks for, not something that should run on every filter keystroke.
+ * because both are explicit, comparatively expensive steps the merchant asks
+ * for, not something that should run on every filter keystroke.
  *
- * Read-only: this computes diffs and returns them. Nothing here writes to
- * Shopify; applying is Phase 4.
+ * Apply deliberately posts the same four things Preview does, plus the rows the
+ * merchant unticked. It does NOT post the diff rows: the server re-resolves the
+ * selection and recomputes every value with the same code that produced the
+ * preview, so a tampered or stale row list cannot become a write. Everything
+ * past creating the job happens in the background — see `apply.server.ts`.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const body = (await request.json()) as {
+    intent?: string;
     filters?: string;
     actions?: string;
     selection?: unknown;
     sort?: string;
+    excluded?: unknown;
+    scopeLabel?: string;
   };
 
   const filters = parseFilters(new URLSearchParams(body.filters ?? ""));
   const [rawKey, rawDirection] = (body.sort ?? DEFAULT_SORT).split(" ");
+  const sortKey = isSortKey(rawKey) ? rawKey : "TITLE";
+  const reverse = rawDirection === "desc";
+  const actions = parseActions(body.actions);
+  const selection = coerceSelection(body.selection);
 
-  const preview = await buildPreview(admin, {
+  if (body.intent === "apply") {
+    const scope: JobScope = {
+      filters,
+      selection,
+      excluded: Array.isArray(body.excluded)
+        ? body.excluded.filter((id): id is string => typeof id === "string")
+        : [],
+      sortKey,
+      reverse,
+    };
+    try {
+      const job = await createApplyJob({
+        shopId: session.shop,
+        name: jobName(actions, String(body.scopeLabel ?? "").slice(0, 60)),
+        scope,
+        actions,
+      });
+      runJobDetached(session.shop, job.id);
+      return { jobId: job.id, error: null } satisfies ApplyResponse;
+    } catch (error) {
+      if (error instanceof PlanLimitError || error instanceof JobRequestError) {
+        return { jobId: null, error: error.message } satisfies ApplyResponse;
+      }
+      throw error;
+    }
+  }
+
+  return buildPreview(admin, {
     filters,
-    actions: parseActions(body.actions),
-    selection: coerceSelection(body.selection),
-    sortKey: isSortKey(rawKey) ? rawKey : "TITLE",
-    reverse: rawDirection === "desc",
+    actions,
+    selection,
+    sortKey,
+    reverse,
   });
-
-  return preview;
 };
 
 export default function NewBulkEdit() {
@@ -216,6 +268,56 @@ export default function NewBulkEdit() {
   const selectionEmpty =
     selection.selection.mode === "some" && selection.selection.ids.length === 0;
   const canPreview = !selectionEmpty && completeActions.length > 0;
+
+  // --- apply ----------------------------------------------------------------
+
+  const applyFetcher = useFetcher<ApplyResponse>();
+  const navigate = useNavigate();
+  const [confirming, setConfirming] = useState(false);
+
+  const summary = useMemo(
+    () => includedSummary(preview, new Set(excluded)),
+    [preview, excluded],
+  );
+
+  /**
+   * SPEC §6: Apply stays off until a preview exists — force the safe path. It
+   * is off for a stale one too, because `preview` goes null the moment the
+   * filter, selection or actions move away from what was previewed.
+   */
+  const canApply = preview !== null && summary.rows > 0;
+  const applying = applyFetcher.state !== "idle";
+
+  const runApply = useCallback(() => {
+    setConfirming(false);
+    applyFetcher.submit(
+      {
+        intent: "apply",
+        filters: serializeFilters(filters).toString(),
+        actions: JSON.stringify(actions),
+        selection: selection.selection,
+        sort,
+        excluded,
+        scopeLabel: describeScope(filters, facets.collections),
+      },
+      { method: "POST", encType: "application/json" },
+    );
+  }, [
+    applyFetcher,
+    filters,
+    actions,
+    selection.selection,
+    sort,
+    excluded,
+    facets.collections,
+  ]);
+
+  // Once a job exists it, not this page, is where progress, failures and Undo
+  // live — so the merchant goes there rather than being left on a stale diff.
+  const createdJobId = applyFetcher.data?.jobId ?? null;
+  useEffect(() => {
+    if (createdJobId) navigate(`/app/jobs/${createdJobId}`);
+  }, [createdJobId, navigate]);
 
   // --- navigation helpers ---------------------------------------------------
 
@@ -337,14 +439,24 @@ export default function NewBulkEdit() {
       subtitle="Select products, stack edit actions, preview every change"
       primaryAction={{
         content: "Apply changes",
-        disabled: true,
-        helpText: "Applying lands in the next phase — this step is preview-only",
+        disabled: !canApply || applying,
+        loading: applying,
+        onAction: () => setConfirming(true),
+        helpText: canApply
+          ? undefined
+          : "Preview the changes first — nothing can be applied without a diff to approve",
       }}
     >
       <TitleBar title="New bulk edit" />
       <Layout>
         <Layout.Section>
           <BlockStack gap="400">
+            {applyFetcher.data?.error ? (
+              <Banner tone="critical" title="This edit was not started">
+                <p>{applyFetcher.data.error}</p>
+              </Banner>
+            ) : null}
+
             <ViewToggle
               view={filters.view}
               onChange={(view) => patchFilters({ view })}
@@ -497,8 +609,165 @@ export default function NewBulkEdit() {
           </BlockStack>
         </Layout.Section>
       </Layout>
+
+      <ApplyConfirmModal
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        onConfirm={runApply}
+        applying={applying}
+        actions={completeActions}
+        summary={summary}
+        scopeLabel={describeScope(filters, facets.collections)}
+      />
     </Page>
   );
+}
+
+// --- apply ------------------------------------------------------------------
+
+/**
+ * The last thing between a merchant and their catalog.
+ *
+ * It restates the counts, the actions, and what they are being applied to,
+ * because "312 products · 894 variants" is the number a merchant checks against
+ * what they meant to do — and it says plainly that the undo data is written
+ * first, which is what makes clicking Apply a reasonable thing to do.
+ */
+function ApplyConfirmModal({
+  open,
+  onClose,
+  onConfirm,
+  applying,
+  actions,
+  summary,
+  scopeLabel,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  applying: boolean;
+  actions: EditAction[];
+  summary: IncludedSummary;
+  scopeLabel: string;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Apply this edit?"
+      primaryAction={{
+        content: `Apply ${summary.rows.toLocaleString()} change${
+          summary.rows === 1 ? "" : "s"
+        }`,
+        onAction: onConfirm,
+        loading: applying,
+      }}
+      secondaryActions={[{ content: "Cancel", onAction: onClose }]}
+    >
+      <Modal.Section>
+        <BlockStack gap="400">
+          <Banner tone="warning">
+            <p>
+              This writes to{" "}
+              <strong>
+                {summary.products.toLocaleString()}{" "}
+                {summary.products === 1 ? "product" : "products"}
+              </strong>
+              {summary.variants > 0 ? (
+                <>
+                  {" and "}
+                  <strong>
+                    {summary.variants.toLocaleString()}{" "}
+                    {summary.variants === 1 ? "variant" : "variants"}
+                  </strong>
+                </>
+              ) : null}{" "}
+              in {scopeLabel}.
+            </p>
+          </Banner>
+
+          <BlockStack gap="100">
+            <Text as="h3" variant="headingSm">
+              What will be changed
+            </Text>
+            <List>
+              {actions.map((action, index) => (
+                <List.Item key={index}>{describeActions([action])}</List.Item>
+              ))}
+            </List>
+          </BlockStack>
+
+          <Text as="p" variant="bodySm" tone="subdued">
+            Every value this edit overwrites is saved before the first change is
+            written. Undo restores all of them in one click — free, on any plan.
+          </Text>
+        </BlockStack>
+      </Modal.Section>
+    </Modal>
+  );
+}
+
+interface IncludedSummary {
+  products: number;
+  variants: number;
+  rows: number;
+  /** False once the row limit clips the table and the server's counts stand. */
+  exact: boolean;
+}
+
+/**
+ * What is actually going to be applied, after per-row exclusions.
+ *
+ * Exact whenever every changed row is on screen. Past `PREVIEW_ROW_LIMIT` we
+ * cannot recount products from what is visible, so the server's totals stand
+ * and exclusions only account for the rows the merchant could see.
+ */
+function includedSummary(
+  preview: PreviewResult | null,
+  excludedSet: Set<string>,
+): IncludedSummary {
+  if (!preview) return { products: 0, variants: 0, rows: 0, exact: true };
+
+  const included = preview.rows.filter((row) => !excludedSet.has(row.id));
+  const exact = !preview.rowsTruncated;
+
+  return {
+    products: exact
+      ? new Set(included.map((row) => row.productId)).size
+      : preview.productsChanged,
+    variants: exact
+      ? included.filter((row) => row.kind === "variant").length
+      : preview.variantsChanged,
+    rows: exact
+      ? included.length
+      : Math.max(0, preview.totalRows - excludedSet.size),
+    exact,
+  };
+}
+
+/**
+ * A short name for what the edit was applied to, for the job's auto-title.
+ * Collections first — "Price −15% on Summer Sale" is how a merchant describes
+ * the edit they just ran.
+ */
+function describeScope(
+  filters: SelectFilters,
+  collections: FacetOption[],
+): string {
+  if (filters.collectionId) {
+    const label = collections.find(
+      (option) => option.value === filters.collectionId,
+    )?.label;
+    // Facet labels carry a "(123)" product count that has no place in a name.
+    if (label) return label.replace(/\s*\(\d[\d,]*\)$/, "");
+  }
+  if (filters.vendors.length === 1) return filters.vendors[0];
+  if (filters.productTypes.length === 1) return filters.productTypes[0];
+  if (filters.tags.length === 1) return `tag "${filters.tags[0]}"`;
+  if (filters.search) return `"${filters.search}"`;
+
+  const count = activeFilterCount(filters);
+  return count > 0 ? `${count} filters` : "all products";
 }
 
 // --- selection --------------------------------------------------------------
@@ -1282,17 +1551,8 @@ function PreviewBody({
   ) => void;
 }) {
   const included = rows.filter((row) => !excludedSet.has(row.id));
-
-  // Exact when every changed row is on screen. Once the row limit clips the
-  // table we can't recount products from what's visible, so the server's
-  // numbers stand and the banner says the exclusions only cover shown rows.
-  const exact = !preview.rowsTruncated;
-  const products = exact
-    ? new Set(included.map((row) => row.productId)).size
-    : preview.productsChanged;
-  const variants = exact
-    ? included.filter((row) => row.kind === "variant").length
-    : preview.variantsChanged;
+  // The same arithmetic the Apply modal quotes, so the two can never disagree.
+  const { products, variants } = includedSummary(preview, excludedSet);
 
   if (preview.totalRows === 0) {
     return (

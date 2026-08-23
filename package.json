@@ -19,7 +19,8 @@
     "shopify": "shopify",
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
-    "vite": "vite"
+    "vite": "vite",
+    "verify:apply": "tsx scripts/verify-apply.ts"
   },
   "type": "module",
   "engines": {
