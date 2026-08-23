@@ -14,6 +14,35 @@ export type Selection =
 
 const NOTHING: Selection = { mode: "some", ids: [] };
 
+/**
+ * Validates a selection that arrived over the wire. The preview endpoint is
+ * driven by whatever the browser posts, so anything unrecognised collapses to
+ * "nothing selected" rather than being trusted into a diff.
+ */
+export function coerceSelection(value: unknown): Selection {
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const strings = (input: unknown) =>
+      Array.isArray(input)
+        ? input.filter((item): item is string => typeof item === "string")
+        : [];
+    if (record.mode === "all") {
+      return { mode: "all", excluded: strings(record.excluded) };
+    }
+    if (record.mode === "some") {
+      return { mode: "some", ids: strings(record.ids) };
+    }
+  }
+  return NOTHING;
+}
+
+/** Identity of a selection — used to drop a preview that no longer describes it. */
+export function selectionSignature(selection: Selection): string {
+  return selection.mode === "all"
+    ? `all:${[...selection.excluded].sort().join(",")}`
+    : `some:${[...selection.ids].sort().join(",")}`;
+}
+
 export interface SelectionApi {
   selection: Selection;
   /** True once "select all matching filter" is on. */

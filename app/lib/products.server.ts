@@ -231,40 +231,16 @@ async function scanProductPage(
 ): Promise<ProductPage> {
   const variantView = filters.view === "variant";
   const pageSize = variantView ? VARIANT_VIEW_PAGE_SIZE : PRODUCT_PAGE_SIZE;
-  const includeVariants = variantView || residualNeedsVariants(residual);
 
-  const matched: ProductNode[] = [];
-  let after: string | null = null;
-  let scanned = 0;
-  let truncated = false;
-
-  for (;;) {
-    const data: ProductPageResponse = await runPageQuery(admin, {
-      first: SCAN_PAGE_SIZE,
-      last: null,
-      after,
-      before: null,
-      query: query || null,
+  const { products: matched, truncated } = await collectMatchingProducts(
+    admin,
+    {
+      filters,
       sortKey,
       reverse,
-      variantLimit: VARIANTS_PER_PRODUCT,
-      includeVariants,
-    });
-
-    for (const node of data.products.nodes) {
-      if (productMatchesResidual(toProductLike(node), residual)) {
-        matched.push(node);
-      }
-    }
-    scanned += data.products.nodes.length;
-
-    if (!data.products.pageInfo.hasNextPage) break;
-    if (scanned >= SCAN_PRODUCT_CAP) {
-      truncated = true;
-      break;
-    }
-    after = data.products.pageInfo.endCursor;
-  }
+      includeVariants: variantView || residualNeedsVariants(residual),
+    },
+  );
 
   const offset = Math.min(
     Math.max(0, decodeOffset(cursor)),
@@ -292,6 +268,74 @@ async function scanProductPage(
     ...rowStats(products, variantView),
     query,
   };
+}
+
+export interface CollectArgs {
+  filters: SelectFilters;
+  sortKey: SortKey;
+  reverse: boolean;
+  includeVariants: boolean;
+  /** Products fetched before giving up. Defaults to `SCAN_PRODUCT_CAP`. */
+  cap?: number;
+  /** Products per request. Lower it when variants make each node expensive. */
+  pageSize?: number;
+}
+
+/**
+ * Every product matching `filters`, in sort order, with the residual filters
+ * already applied.
+ *
+ * Shared by the collection-filter pagination path and by preview, which both
+ * need the whole matching set rather than a page: one to count and slice it,
+ * the other to diff it. `truncated` is true when the cap cut the scan short,
+ * and every caller has to surface that rather than quietly under-report.
+ */
+export async function collectMatchingProducts(
+  admin: AdminApiContext,
+  { filters, sortKey, reverse, includeVariants, cap, pageSize }: CollectArgs,
+): Promise<{ products: ProductNode[]; truncated: boolean }> {
+  const plan = planProductQuery(filters);
+  const limit = cap ?? SCAN_PRODUCT_CAP;
+  const perRequest = pageSize ?? SCAN_PAGE_SIZE;
+
+  const products: ProductNode[] = [];
+  let after: string | null = null;
+  let scanned = 0;
+  let truncated = false;
+
+  for (;;) {
+    const data: ProductPageResponse = await runPageQuery(admin, {
+      first: perRequest,
+      last: null,
+      after,
+      before: null,
+      query: plan.query || null,
+      sortKey,
+      reverse,
+      variantLimit: VARIANTS_PER_PRODUCT,
+      includeVariants,
+    });
+
+    for (const node of data.products.nodes) {
+      if (
+        plan.residual &&
+        !productMatchesResidual(toProductLike(node), plan.residual)
+      ) {
+        continue;
+      }
+      products.push(node);
+    }
+    scanned += data.products.nodes.length;
+
+    if (!data.products.pageInfo.hasNextPage) break;
+    if (scanned >= limit) {
+      truncated = true;
+      break;
+    }
+    after = data.products.pageInfo.endCursor;
+  }
+
+  return { products, truncated };
 }
 
 function decodeOffset(cursor: string | null): number {
@@ -362,7 +406,7 @@ export async function fetchFacets(admin: AdminApiContext): Promise<Facets> {
 
 // --- response shapes --------------------------------------------------------
 
-interface ProductNode {
+export interface ProductNode {
   id: string;
   title: string;
   handle: string;

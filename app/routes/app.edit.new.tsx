@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useNavigation, useSearchParams } from "@remix-run/react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
+  useFetcher,
+  useLoaderData,
+  useNavigation,
+  useSearchParams,
+} from "@remix-run/react";
+import {
+  ActionList,
   Autocomplete,
   Badge,
   Banner,
@@ -18,16 +24,33 @@ import {
   InlineStack,
   Layout,
   Page,
+  Popover,
+  Select,
+  Tag,
   Text,
   TextField,
   Thumbnail,
   useSetIndexFiltersMode,
 } from "@shopify/polaris";
-import { ImageIcon } from "@shopify/polaris-icons";
+import { ImageIcon, PlusIcon } from "@shopify/polaris-icons";
 import { TitleBar } from "@shopify/app-bridge-react";
 
 import { authenticate } from "../shopify.server";
-import { useSelection } from "../lib/use-selection";
+import {
+  coerceSelection,
+  selectionSignature,
+  useSelection,
+} from "../lib/use-selection";
+import type { EditAction, PreviewRow } from "../lib/actions";
+import {
+  ACTION_TYPES,
+  actionsSignature,
+  isActionComplete,
+  newAction,
+  parseActions,
+} from "../lib/actions";
+import type { PreviewResult } from "../lib/preview.server";
+import { buildPreview } from "../lib/preview.server";
 import type { ProductStatus, SelectFilters, SelectView } from "../lib/filters";
 import {
   PRODUCT_STATUSES,
@@ -45,6 +68,7 @@ import type {
   VariantRow,
 } from "../lib/catalog";
 import {
+  PREVIEW_PRODUCT_CAP,
   PRODUCT_PAGE_SIZE,
   SORT_OPTIONS,
   VARIANT_VIEW_PAGE_SIZE,
@@ -79,6 +103,38 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   };
 };
 
+/**
+ * Preview endpoint. POSTed to rather than folded into the loader because the
+ * selection can be thousands of ids — that belongs in a body, not a URL — and
+ * because previewing is an explicit, comparatively expensive step the merchant
+ * asks for, not something that should run on every filter keystroke.
+ *
+ * Read-only: this computes diffs and returns them. Nothing here writes to
+ * Shopify; applying is Phase 4.
+ */
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { admin } = await authenticate.admin(request);
+  const body = (await request.json()) as {
+    filters?: string;
+    actions?: string;
+    selection?: unknown;
+    sort?: string;
+  };
+
+  const filters = parseFilters(new URLSearchParams(body.filters ?? ""));
+  const [rawKey, rawDirection] = (body.sort ?? DEFAULT_SORT).split(" ");
+
+  const preview = await buildPreview(admin, {
+    filters,
+    actions: parseActions(body.actions),
+    selection: coerceSelection(body.selection),
+    sortKey: isSortKey(rawKey) ? rawKey : "TITLE",
+    reverse: rawDirection === "desc",
+  });
+
+  return preview;
+};
+
 export default function NewBulkEdit() {
   const { page, facets, filters, sort } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -88,6 +144,78 @@ export default function NewBulkEdit() {
   const loading = navigation.state === "loading";
   const variantView = filters.view === "variant";
   const selection = useSelectionForFilters(filters);
+
+  // --- edit actions ---------------------------------------------------------
+
+  const [actions, setActions] = useState<EditAction[]>([]);
+  const completeActions = useMemo(
+    () => actions.filter(isActionComplete),
+    [actions],
+  );
+
+  const addAction = useCallback(
+    (type: EditAction["type"]) =>
+      setActions((current) => [...current, newAction(type)]),
+    [],
+  );
+  const updateAction = useCallback(
+    (index: number, next: EditAction) =>
+      setActions((current) =>
+        current.map((action, i) => (i === index ? next : action)),
+      ),
+    [],
+  );
+  const removeAction = useCallback(
+    (index: number) =>
+      setActions((current) => current.filter((_, i) => i !== index)),
+    [],
+  );
+
+  // --- preview --------------------------------------------------------------
+
+  const previewFetcher = useFetcher<PreviewResult>();
+
+  /**
+   * Identity of what a preview describes. Any change to the filter, the
+   * selection or the actions makes an existing diff table a lie, so the preview
+   * is hidden until it is regenerated rather than left on screen looking valid.
+   */
+  const previewKey = useMemo(
+    () =>
+      [
+        filterSignature(filters),
+        sort,
+        selectionSignature(selection.selection),
+        actionsSignature(actions),
+      ].join("|"),
+    [filters, sort, selection.selection, actions],
+  );
+  const [previewedKey, setPreviewedKey] = useState<string | null>(null);
+  const [excluded, setExcluded] = useState<string[]>([]);
+
+  const previewing = previewFetcher.state !== "idle";
+  const preview =
+    previewedKey === previewKey && previewFetcher.data
+      ? previewFetcher.data
+      : null;
+
+  const runPreview = useCallback(() => {
+    setPreviewedKey(previewKey);
+    setExcluded([]);
+    previewFetcher.submit(
+      {
+        filters: serializeFilters(filters).toString(),
+        actions: JSON.stringify(actions),
+        selection: selection.selection,
+        sort,
+      },
+      { method: "POST", encType: "application/json" },
+    );
+  }, [previewFetcher, previewKey, filters, actions, selection.selection, sort]);
+
+  const selectionEmpty =
+    selection.selection.mode === "some" && selection.selection.ids.length === 0;
+  const canPreview = !selectionEmpty && completeActions.length > 0;
 
   // --- navigation helpers ---------------------------------------------------
 
@@ -206,11 +334,11 @@ export default function NewBulkEdit() {
     <Page
       backAction={{ content: "Amend", url: "/app" }}
       title="New bulk edit"
-      subtitle="Step 1 of 3 — choose what to edit"
+      subtitle="Select products, stack edit actions, preview every change"
       primaryAction={{
-        content: "Choose edit actions",
+        content: "Apply changes",
         disabled: true,
-        helpText: "Available in the next step",
+        helpText: "Applying lands in the next phase — this step is preview-only",
       }}
     >
       <TitleBar title="New bulk edit" />
@@ -347,6 +475,25 @@ export default function NewBulkEdit() {
                 </p>
               </Banner>
             ) : null}
+
+            <ActionsBuilder
+              actions={actions}
+              onAdd={addAction}
+              onUpdate={updateAction}
+              onRemove={removeAction}
+            />
+
+            <PreviewSection
+              preview={preview}
+              previewing={previewing}
+              canPreview={canPreview}
+              stale={previewedKey !== null && previewedKey !== previewKey}
+              selectionEmpty={selectionEmpty}
+              hasActions={completeActions.length > 0}
+              excluded={excluded}
+              onExcludedChange={setExcluded}
+              onRun={runPreview}
+            />
           </BlockStack>
         </Layout.Section>
       </Layout>
@@ -710,6 +857,582 @@ function SelectionSummary({
         ) : null}
       </BlockStack>
     </Card>
+  );
+}
+
+// --- actions builder --------------------------------------------------------
+
+function ActionsBuilder({
+  actions,
+  onAdd,
+  onUpdate,
+  onRemove,
+}: {
+  actions: EditAction[];
+  onAdd: (type: EditAction["type"]) => void;
+  onUpdate: (index: number, action: EditAction) => void;
+  onRemove: (index: number) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <InlineStack align="space-between" blockAlign="center" gap="400">
+          <BlockStack gap="100">
+            <Text as="h2" variant="headingSm">
+              Edit actions
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Stack as many as you need — they apply in order, as one job.
+            </Text>
+          </BlockStack>
+          <Popover
+            active={menuOpen}
+            onClose={() => setMenuOpen(false)}
+            activator={
+              <Button
+                icon={PlusIcon}
+                disclosure
+                onClick={() => setMenuOpen((open) => !open)}
+              >
+                Add action
+              </Button>
+            }
+          >
+            <ActionList
+              actionRole="menuitem"
+              items={ACTION_TYPES.map(({ type, label }) => ({
+                content: label,
+                onAction: () => {
+                  onAdd(type);
+                  setMenuOpen(false);
+                },
+              }))}
+            />
+          </Popover>
+        </InlineStack>
+
+        {actions.length === 0 ? (
+          <Box
+            padding="400"
+            background="bg-surface-secondary"
+            borderRadius="200"
+          >
+            <Text as="p" variant="bodyMd" tone="subdued" alignment="center">
+              No actions yet. Add a price, tag, or status change to see exactly
+              what it would do.
+            </Text>
+          </Box>
+        ) : (
+          <BlockStack gap="300">
+            {actions.map((action, index) => (
+              <ActionEditor
+                key={`${index}-${action.type}`}
+                action={action}
+                onChange={(next) => onUpdate(index, next)}
+                onRemove={() => onRemove(index)}
+              />
+            ))}
+          </BlockStack>
+        )}
+      </BlockStack>
+    </Card>
+  );
+}
+
+function ActionEditor({
+  action,
+  onChange,
+  onRemove,
+}: {
+  action: EditAction;
+  onChange: (action: EditAction) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <Box
+      padding="300"
+      borderWidth="025"
+      borderColor="border"
+      borderRadius="200"
+    >
+      <InlineStack align="space-between" blockAlign="start" gap="400" wrap>
+        {action.type === "price" ? (
+          <PriceFields action={action} onChange={onChange} />
+        ) : action.type === "tags" ? (
+          <TagFields action={action} onChange={onChange} />
+        ) : (
+          <StatusFields action={action} onChange={onChange} />
+        )}
+        <Box paddingBlockStart="500">
+          <Button variant="tertiary" tone="critical" onClick={onRemove}>
+            Remove
+          </Button>
+        </Box>
+      </InlineStack>
+    </Box>
+  );
+}
+
+function PriceFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "price" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  const byPercent = action.unit === "percent" && action.op !== "set";
+  return (
+    <InlineStack gap="300" blockAlign="end" wrap>
+      <Select
+        label="Field"
+        options={[
+          { label: "Price", value: "price" },
+          { label: "Compare at price", value: "compareAtPrice" },
+        ]}
+        value={action.field}
+        onChange={(field) =>
+          onChange({ ...action, field: field as typeof action.field })
+        }
+      />
+      <Select
+        label="Change"
+        options={[
+          { label: "Decrease by", value: "decrease" },
+          { label: "Increase by", value: "increase" },
+          { label: "Set to", value: "set" },
+        ]}
+        value={action.op}
+        onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
+      />
+      <Box maxWidth="120px">
+        <TextField
+          label="Amount"
+          type="number"
+          min={0}
+          value={action.amount}
+          onChange={(amount) => onChange({ ...action, amount })}
+          prefix={byPercent ? undefined : "$"}
+          suffix={byPercent ? "%" : undefined}
+          autoComplete="off"
+        />
+      </Box>
+      {action.op === "set" ? null : (
+        <Select
+          label="Unit"
+          options={[
+            { label: "Percent", value: "percent" },
+            { label: "Amount", value: "fixed" },
+          ]}
+          value={action.unit}
+          onChange={(unit) =>
+            onChange({ ...action, unit: unit as typeof action.unit })
+          }
+        />
+      )}
+      <Select
+        label="Round to"
+        options={[
+          { label: "Don't round", value: "none" },
+          { label: "….99", value: "end99" },
+          { label: "….95", value: "end95" },
+          { label: "Whole number", value: "end00" },
+        ]}
+        value={action.rounding}
+        onChange={(rounding) =>
+          onChange({ ...action, rounding: rounding as typeof action.rounding })
+        }
+      />
+    </InlineStack>
+  );
+}
+
+/**
+ * Tags are entered one at a time rather than as a comma-separated string. A
+ * single text field would have to re-parse on every keystroke, which eats the
+ * separator the merchant just typed.
+ */
+function TagFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "tags" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  const [input, setInput] = useState("");
+
+  const commit = useCallback(() => {
+    const tag = input.trim();
+    if (!tag) return;
+    const exists = action.tags.some(
+      (existing) => existing.toLowerCase() === tag.toLowerCase(),
+    );
+    if (!exists) onChange({ ...action, tags: [...action.tags, tag] });
+    setInput("");
+  }, [action, input, onChange]);
+
+  return (
+    <BlockStack gap="200">
+      <InlineStack gap="300" blockAlign="end" wrap>
+        <Select
+          label="Tags"
+          options={[
+            { label: "Add", value: "add" },
+            { label: "Remove", value: "remove" },
+            { label: "Replace all with", value: "replace" },
+          ]}
+          value={action.op}
+          onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
+        />
+        <TextField
+          label="Tag"
+          value={input}
+          onChange={setInput}
+          onBlur={commit}
+          placeholder="Type a tag, press Enter"
+          autoComplete="off"
+        />
+        <Button onClick={commit} disabled={!input.trim()}>
+          Add tag
+        </Button>
+      </InlineStack>
+      {action.tags.length ? (
+        <InlineStack gap="200" wrap>
+          {action.tags.map((tag) => (
+            <Tag
+              key={tag}
+              onRemove={() =>
+                onChange({
+                  ...action,
+                  tags: action.tags.filter((existing) => existing !== tag),
+                })
+              }
+            >
+              {tag}
+            </Tag>
+          ))}
+        </InlineStack>
+      ) : action.op === "replace" ? (
+        <Text as="p" variant="bodySm" tone="subdued">
+          No tags listed — this will clear every tag on the selected products.
+        </Text>
+      ) : null}
+    </BlockStack>
+  );
+}
+
+function StatusFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "status" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  return (
+    <Select
+      label="Set status to"
+      options={PRODUCT_STATUSES.map((status) => ({
+        label: status.charAt(0) + status.slice(1).toLowerCase(),
+        value: status,
+      }))}
+      value={action.value}
+      onChange={(value) =>
+        onChange({ ...action, value: value as ProductStatus })
+      }
+    />
+  );
+}
+
+// --- preview ----------------------------------------------------------------
+
+function PreviewSection({
+  preview,
+  previewing,
+  canPreview,
+  stale,
+  selectionEmpty,
+  hasActions,
+  excluded,
+  onExcludedChange,
+  onRun,
+}: {
+  preview: PreviewResult | null;
+  previewing: boolean;
+  canPreview: boolean;
+  stale: boolean;
+  selectionEmpty: boolean;
+  hasActions: boolean;
+  excluded: string[];
+  onExcludedChange: (excluded: string[]) => void;
+  onRun: () => void;
+}) {
+  const excludedSet = useMemo(() => new Set(excluded), [excluded]);
+  const rows = useMemo(() => preview?.rows ?? [], [preview]);
+
+  const setMany = useCallback(
+    (ids: string[], including: boolean) => {
+      const next = new Set(excludedSet);
+      for (const id of ids) {
+        if (including) next.delete(id);
+        else next.add(id);
+      }
+      onExcludedChange([...next]);
+    },
+    [excludedSet, onExcludedChange],
+  );
+
+  const handleSelectionChange = useCallback(
+    (
+      selectionType: IndexTableSelectionType,
+      isSelecting: boolean,
+      selectionId?: string | [number, number],
+    ) => {
+      switch (selectionType) {
+        case IndexTableSelectionType.All:
+        case IndexTableSelectionType.Page:
+          setMany(
+            rows.map((row) => row.id),
+            isSelecting,
+          );
+          return;
+        case IndexTableSelectionType.Multi:
+        case IndexTableSelectionType.Range: {
+          if (!Array.isArray(selectionId)) return;
+          const [start, end] = selectionId;
+          setMany(
+            rows.slice(start, end + 1).map((row) => row.id),
+            isSelecting,
+          );
+          return;
+        }
+        case IndexTableSelectionType.Single:
+          if (typeof selectionId === "string") {
+            setMany([selectionId], isSelecting);
+          }
+      }
+    },
+    [rows, setMany],
+  );
+
+  const helper = selectionEmpty
+    ? "Select some products above first."
+    : !hasActions
+      ? "Add at least one edit action above."
+      : null;
+
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <InlineStack align="space-between" blockAlign="center" gap="400">
+          <BlockStack gap="100">
+            <Text as="h2" variant="headingSm">
+              Preview
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued">
+              {helper ??
+                "Every before → after value, computed on the server. Nothing is written until you apply."}
+            </Text>
+          </BlockStack>
+          <Button
+            variant="primary"
+            onClick={onRun}
+            disabled={!canPreview || previewing}
+            loading={previewing}
+          >
+            {preview ? "Refresh preview" : "Preview changes"}
+          </Button>
+        </InlineStack>
+
+        {stale && !previewing ? (
+          <Banner tone="warning">
+            <p>
+              The selection or actions changed since this preview was generated.
+              Run it again to see the current diff.
+            </p>
+          </Banner>
+        ) : null}
+
+        {preview ? (
+          <PreviewBody
+            preview={preview}
+            rows={rows}
+            excludedSet={excludedSet}
+            onSelectionChange={handleSelectionChange}
+          />
+        ) : null}
+      </BlockStack>
+    </Card>
+  );
+}
+
+function PreviewBody({
+  preview,
+  rows,
+  excludedSet,
+  onSelectionChange,
+}: {
+  preview: PreviewResult;
+  rows: PreviewRow[];
+  excludedSet: Set<string>;
+  onSelectionChange: (
+    selectionType: IndexTableSelectionType,
+    isSelecting: boolean,
+    selectionId?: string | [number, number],
+  ) => void;
+}) {
+  const included = rows.filter((row) => !excludedSet.has(row.id));
+
+  // Exact when every changed row is on screen. Once the row limit clips the
+  // table we can't recount products from what's visible, so the server's
+  // numbers stand and the banner says the exclusions only cover shown rows.
+  const exact = !preview.rowsTruncated;
+  const products = exact
+    ? new Set(included.map((row) => row.productId)).size
+    : preview.productsChanged;
+  const variants = exact
+    ? included.filter((row) => row.kind === "variant").length
+    : preview.variantsChanged;
+
+  if (preview.totalRows === 0) {
+    return (
+      <Banner tone="info" title="Nothing would change">
+        <p>
+          These actions leave every selected product exactly as it is
+          {preview.productsUnchanged > 0
+            ? ` — all ${preview.productsUnchanged.toLocaleString()} of them`
+            : ""}
+          . Adjust the actions and preview again.
+        </p>
+      </Banner>
+    );
+  }
+
+  return (
+    <BlockStack gap="300">
+      <Banner tone="info">
+        <p>
+          <strong>
+            {products.toLocaleString()} {products === 1 ? "product" : "products"}{" "}
+            · {variants.toLocaleString()}{" "}
+            {variants === 1 ? "variant" : "variants"} will change
+          </strong>
+          {excludedSet.size
+            ? ` · ${excludedSet.size.toLocaleString()} excluded`
+            : ""}
+          {preview.productsUnchanged
+            ? ` · ${preview.productsUnchanged.toLocaleString()} selected products already match`
+            : ""}
+          .
+        </p>
+      </Banner>
+
+      {preview.truncated ? (
+        <Banner tone="warning">
+          <p>
+            The selection is larger than one preview covers, so this diff stops
+            at the first {PREVIEW_PRODUCT_CAP.toLocaleString()} products
+            scanned. Narrow the filter to review the rest.
+          </p>
+        </Banner>
+      ) : null}
+
+      {preview.rowsTruncated ? (
+        <Banner tone="warning">
+          <p>
+            Showing the first {rows.length.toLocaleString()} of{" "}
+            {preview.totalRows.toLocaleString()} changed rows. Excluding rows
+            here only affects the ones shown.
+          </p>
+        </Banner>
+      ) : null}
+
+      {preview.clippedProducts ? (
+        <Banner tone="warning">
+          <p>
+            {preview.clippedProducts.toLocaleString()} selected{" "}
+            {preview.clippedProducts === 1 ? "product has" : "products have"}{" "}
+            more variants than a single preview query returns, so not every
+            variant is listed below.
+          </p>
+        </Banner>
+      ) : null}
+
+      <IndexTable
+        resourceName={{ singular: "change", plural: "changes" }}
+        itemCount={rows.length}
+        selectedItemsCount={
+          included.length === rows.length ? "All" : included.length
+        }
+        onSelectionChange={onSelectionChange}
+        headings={[
+          { title: "Row" },
+          { title: "Field" },
+          { title: "Before", alignment: "end" },
+          { title: "After", alignment: "end" },
+        ]}
+      >
+        {rows.map((row, index) => (
+          <IndexTable.Row
+            id={row.id}
+            key={row.id}
+            position={index}
+            selected={!excludedSet.has(row.id)}
+          >
+            <IndexTable.Cell>
+              <BlockStack gap="050">
+                <Text as="span" variant="bodyMd" fontWeight="semibold">
+                  {row.productTitle}
+                </Text>
+                <Text as="span" variant="bodySm" tone="subdued">
+                  {row.kind === "variant"
+                    ? [row.variantTitle, row.sku].filter(Boolean).join(" · ")
+                    : "Product"}
+                </Text>
+              </BlockStack>
+            </IndexTable.Cell>
+            <IndexTable.Cell>
+              <BlockStack gap="050">
+                {row.diffs.map((diff) => (
+                  <Text as="span" key={diff.fieldPath} variant="bodySm">
+                    {diff.label}
+                  </Text>
+                ))}
+              </BlockStack>
+            </IndexTable.Cell>
+            <IndexTable.Cell>
+              <BlockStack gap="050" inlineAlign="end">
+                {row.diffs.map((diff) => (
+                  <Text
+                    as="span"
+                    key={diff.fieldPath}
+                    variant="bodySm"
+                    tone="subdued"
+                    textDecorationLine="line-through"
+                  >
+                    {diff.before}
+                  </Text>
+                ))}
+              </BlockStack>
+            </IndexTable.Cell>
+            <IndexTable.Cell>
+              <BlockStack gap="050" inlineAlign="end">
+                {row.diffs.map((diff) => (
+                  <Text
+                    as="span"
+                    key={diff.fieldPath}
+                    variant="bodySm"
+                    fontWeight="semibold"
+                  >
+                    {diff.after}
+                  </Text>
+                ))}
+              </BlockStack>
+            </IndexTable.Cell>
+          </IndexTable.Row>
+        ))}
+      </IndexTable>
+    </BlockStack>
   );
 }
 

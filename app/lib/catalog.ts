@@ -23,6 +23,18 @@ export const VARIANT_VIEW_PAGE_SIZE = 25;
  */
 export const VARIANTS_PER_PRODUCT = 25;
 
+/**
+ * Products examined for one preview.
+ *
+ * Lower than the SELECT scan cap because each node here carries its variants,
+ * which makes every request dearer in query cost and slower. A merchant
+ * previewing more than this is past what one reviewable diff table is for.
+ */
+export const PREVIEW_PRODUCT_CAP = 2000;
+
+/** Diff rows sent to the browser. Beyond this the table stops being reviewable. */
+export const PREVIEW_ROW_LIMIT = 500;
+
 export const SORT_OPTIONS = [
   { label: "Title", value: "TITLE" },
   { label: "Vendor", value: "VENDOR" },

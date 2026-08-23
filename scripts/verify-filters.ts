@@ -1,10 +1,15 @@
 /**
- * Runs the real SELECT loader (`fetchProductPage`) against a seeded dev store
- * and checks the row counts against ground truth computed from the seed's PRNG.
+ * Runs the real SELECT loader (`fetchProductPage`) and the real preview builder
+ * (`buildPreview`) against a seeded dev store, checking both against ground
+ * truth computed from the seed's PRNG.
  *
- * This exists because the failure it guards is silent: Shopify answers
- * `collection_id:… AND price:<=20` with HTTP 200, `precision: EXACT`, and zero
- * rows. Nothing throws, so only a count can catch it.
+ * The filter half exists because the failure it guards is silent: Shopify
+ * answers `collection_id:… AND price:<=20` with HTTP 200, `precision: EXACT`,
+ * and zero rows. Nothing throws, so only a count can catch it.
+ *
+ * The preview half exists because a bulk editor's diff arithmetic is the one
+ * thing a merchant cannot check by eye across 3,000 variants. Prices are
+ * asserted down to the cent against values derived from the seed.
  *
  *   SEED_SHOP_DOMAIN=… SEED_ADMIN_TOKEN=… npx tsx scripts/verify-filters.ts
  *
@@ -18,8 +23,11 @@ import process from "node:process";
 
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 
+import type { EditAction } from "../app/lib/actions";
+import { nextPrice, nextTags } from "../app/lib/actions";
 import { emptyFilters } from "../app/lib/filters";
 import type { SelectFilters } from "../app/lib/filters";
+import { buildPreview } from "../app/lib/preview.server";
 import { fetchProductPage } from "../app/lib/products.server";
 
 /** Keep in step with `ApiVersion.July26` in `app/shopify.server.ts`. */
@@ -295,8 +303,190 @@ async function main() {
       `(expected ${String(expectedPaged).padStart(5)})  paginated over ${pages} pages, no duplicates`,
   );
 
+  failures += await verifyPreview(admin, collection.id, truth);
+
   console.log(failures === 0 ? "\nAll checks passed." : `\n${failures} check(s) failed.`);
   process.exit(failures === 0 ? 0 : 1);
+}
+
+// --- preview / diff checks --------------------------------------------------
+
+/** The SPEC §9 acceptance edit: 15% off, ending .99, plus a "sale" tag. */
+const SALE_EDIT: EditAction[] = [
+  {
+    type: "price",
+    field: "price",
+    op: "decrease",
+    unit: "percent",
+    amount: "15",
+    rounding: "end99",
+  },
+  { type: "tags", op: "add", tags: ["sale"] },
+];
+
+async function verifyPreview(
+  admin: AdminApiContext,
+  collectionId: string,
+  truth: Truth[],
+): Promise<number> {
+  let failures = 0;
+  const check = (label: string, actual: unknown, expected: unknown) => {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    if (!ok) failures += 1;
+    console.log(
+      ok
+        ? `PASS  ${label} = ${JSON.stringify(actual)}`
+        : `FAIL  ${label}` +
+            `\n        got      ${JSON.stringify(actual)}` +
+            `\n        expected ${JSON.stringify(expected)}`,
+    );
+  };
+
+  // --- arithmetic, hand-computed. No network, no seed, no room to hide. -----
+  console.log("\nPrice and tag arithmetic:");
+  const pct15 = SALE_EDIT[0] as Extract<EditAction, { type: "price" }>;
+  check("13.27 −15% → .99", nextPrice("13.27", pct15), "11.99");
+  check("17.27 −15% → .99", nextPrice("17.27", pct15), "14.99");
+  check("21.27 −15% → .99", nextPrice("21.27", pct15), "18.99");
+  check(
+    "19.99 −15%, unrounded",
+    nextPrice("19.99", { ...pct15, rounding: "none" }),
+    "16.99",
+  );
+  check(
+    "10.00 +$2.50 fixed",
+    nextPrice("10.00", { ...pct15, op: "increase", unit: "fixed", amount: "2.50", rounding: "none" }),
+    "12.50",
+  );
+  check(
+    "5.00 −$40 floors at zero",
+    nextPrice("5.00", { ...pct15, unit: "fixed", amount: "40", rounding: "none" }),
+    "0.00",
+  );
+  check("null compare-at is left alone", nextPrice(null, pct15), null);
+  check(
+    "set writes a compare-at that was missing",
+    nextPrice(null, { ...pct15, op: "set", amount: "24.99", rounding: "none" }),
+    "24.99",
+  );
+  check(
+    "add tag is case-insensitively idempotent",
+    nextTags(["Sale", "eco"], { type: "tags", op: "add", tags: ["sale"] }),
+    ["Sale", "eco"],
+  );
+  check(
+    "remove tag ignores case",
+    nextTags(["Sale", "eco"], { type: "tags", op: "remove", tags: ["SALE"] }),
+    ["eco"],
+  );
+
+  // --- end to end, against the seeded store --------------------------------
+  const summer = truth.filter((t) => t.collections.includes(0));
+  const inBand = (price: number) => price >= 10 && price <= 20;
+  const selected = summer.filter((t) => t.prices.some(inBand));
+
+  // "sale" is not in the seed's tag pool, so every selected product gains it.
+  // These expectations reuse `nextPrice`, so they check scoping and plumbing —
+  // the arithmetic itself is pinned by the hand-computed checks above.
+  const changedIn = (prices: number[]) =>
+    prices.filter((price) => nextPrice(price.toFixed(2), pct15) !== price.toFixed(2))
+      .length;
+
+  console.log("\nPreview — product view (edit covers whole products):");
+  const productPreview = await buildPreview(admin, {
+    filters: {
+      ...emptyFilters(),
+      collectionId,
+      priceMin: "10",
+      priceMax: "20",
+    },
+    actions: SALE_EDIT,
+    selection: { mode: "all", excluded: [] },
+    sortKey: "TITLE",
+    reverse: false,
+  });
+  check("products changed", productPreview.productsChanged, selected.length);
+  check(
+    "variants changed",
+    productPreview.variantsChanged,
+    selected.reduce((total, t) => total + changedIn(t.prices), 0),
+  );
+  check("nothing truncated", productPreview.truncated, false);
+  check("rows not clipped", productPreview.rowsTruncated, false);
+
+  console.log("\nPreview — variant view (price stays on the picked variants):");
+  const variantPreview = await buildPreview(admin, {
+    filters: {
+      ...emptyFilters(),
+      view: "variant",
+      collectionId,
+      priceMin: "10",
+      priceMax: "20",
+    },
+    actions: SALE_EDIT,
+    selection: { mode: "all", excluded: [] },
+    sortKey: "TITLE",
+    reverse: false,
+  });
+  check("products changed", variantPreview.productsChanged, selected.length);
+  check(
+    "variants changed — only the in-band ones",
+    variantPreview.variantsChanged,
+    selected.reduce(
+      (total, t) => total + changedIn(t.prices.filter(inBand)),
+      0,
+    ),
+  );
+  check(
+    "variant view touches fewer variants than product view",
+    variantPreview.variantsChanged < productPreview.variantsChanged,
+    true,
+  );
+
+  console.log("\nPreview — one product's exact diff:");
+  const sample = selected.find((t) => t.handle === "amend-seed-0018");
+  if (!sample) {
+    console.log("SKIP  amend-seed-0018 is not in the expected selection");
+    return failures;
+  }
+  const sampleRows = productPreview.rows.filter(
+    (row) => row.productTitle === sample.title,
+  );
+  const priceRows = sampleRows
+    .filter((row) => row.kind === "variant")
+    .flatMap((row) => row.diffs.filter((d) => d.fieldPath === "variant.price"))
+    .map((diff) => `${diff.before}→${diff.after}`)
+    .sort();
+  check(
+    `${sample.handle} variant prices`,
+    priceRows,
+    ["13.27→11.99", "17.27→14.99", "21.27→18.99"].sort(),
+  );
+  // Asserted relative to the row's own "before" — Shopify normalises and
+  // reorders tags on write, so pinning an absolute list would be checking
+  // Shopify's ordering rather than the add-to-the-end semantics we care about.
+  const tagDiff = sampleRows
+    .find((row) => row.kind === "product")
+    ?.diffs.find((diff) => diff.fieldPath === "product.tags");
+  check(
+    `${sample.handle} gains "sale", keeps the rest`,
+    tagDiff?.after,
+    tagDiff ? `${tagDiff.before}, sale` : undefined,
+  );
+
+  console.log("\nPreview — a no-op edit reports no changes:");
+  const noop = await buildPreview(admin, {
+    filters: { ...emptyFilters(), collectionId, priceMin: "10", priceMax: "20" },
+    // Every seeded product already carries "amend-seed".
+    actions: [{ type: "tags", op: "add", tags: ["amend-seed"] }],
+    selection: { mode: "all", excluded: [] },
+    sortKey: "TITLE",
+    reverse: false,
+  });
+  check("no rows", noop.totalRows, 0);
+  check("all selected products reported unchanged", noop.productsUnchanged, selected.length);
+
+  return failures;
 }
 
 main().catch((error) => {
