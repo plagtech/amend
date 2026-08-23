@@ -1,4 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# `npm run config:link` rewrites this file and has dropped webhook subscriptions
+# and bumped api_version before now — diff it before committing.
 
 client_id = "cf910c1665cd705b068ebac7863b1966"
 name = "Amend"
@@ -10,7 +12,9 @@ automatically_update_urls_on_dev = true
 include_config_on_deploy = true
 
 [webhooks]
-api_version = "2026-10"
+# Keep in step with `ApiVersion.July26` in app/shopify.server.ts, .graphqlrc.ts,
+# and API_VERSION in scripts/.
+api_version = "2026-07"
 
   # Handled by: /app/routes/webhooks.app.uninstalled.tsx
   [[webhooks.subscriptions]]
