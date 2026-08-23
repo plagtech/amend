@@ -402,9 +402,15 @@ function variantInputs(
  */
 function reportDistribution(count: number, random: () => number) {
   const fakeIds = COLLECTIONS.map((_, i) => `gid://shopify/Collection/${i}`);
-  const specs = Array.from({ length: count }, (_, i) =>
-    generateProduct(i, random, fakeIds),
-  );
+  const specs = Array.from({ length: count }, (_, i) => {
+    const spec = generateProduct(i, random, fakeIds);
+    // A real run calls variantInputs between products, and its inventory draws
+    // advance the same stream. Skip them here and the dry run walks a different
+    // sequence — it predicted 301 products in "Summer Sale" for a run that
+    // created 296. Consume them so the forecast is the catalog you'll get.
+    variantInputs(spec, "gid://shopify/Location/0", random);
+    return spec;
+  });
 
   const tally = (values: string[]) => {
     const counts = new Map<string, number>();

@@ -26,8 +26,18 @@ import {
   VARIANTS_PER_PRODUCT,
   VARIANT_VIEW_PAGE_SIZE,
 } from "./catalog";
-import type { ProductStatus, SelectFilters } from "./filters";
-import { buildProductQuery, variantMatchesFilters } from "./filters";
+import type {
+  ProductLike,
+  ProductStatus,
+  ResidualFilters,
+  SelectFilters,
+} from "./filters";
+import {
+  planProductQuery,
+  productMatchesResidual,
+  residualNeedsVariants,
+  variantMatchesFilters,
+} from "./filters";
 
 const PRODUCT_PAGE_QUERY = `#graphql
   query AmendSelectProducts(
@@ -145,27 +155,163 @@ export interface FetchPageArgs {
 
 export async function fetchProductPage(
   admin: AdminApiContext,
+  args: FetchPageArgs,
+): Promise<ProductPage> {
+  const plan = planProductQuery(args.filters);
+  return plan.residual
+    ? scanProductPage(admin, args, plan.query, plan.residual)
+    : fetchDirectPage(admin, args, plan.query);
+}
+
+/**
+ * The common path: Shopify can answer the whole filter set, so one request
+ * gives us a page, its cursors, and an exact total.
+ */
+async function fetchDirectPage(
+  admin: AdminApiContext,
   { filters, sortKey, reverse, cursor, direction }: FetchPageArgs,
+  query: string,
 ): Promise<ProductPage> {
   const variantView = filters.view === "variant";
   const pageSize = variantView ? VARIANT_VIEW_PAGE_SIZE : PRODUCT_PAGE_SIZE;
-  const query = buildProductQuery(filters);
   const backwards = direction === "prev" && cursor !== null;
 
-  const response = await admin.graphql(PRODUCT_PAGE_QUERY, {
-    variables: {
-      first: backwards ? null : pageSize,
-      last: backwards ? pageSize : null,
-      after: backwards ? null : cursor,
-      before: backwards ? cursor : null,
+  const data = await runPageQuery(admin, {
+    first: backwards ? null : pageSize,
+    last: backwards ? pageSize : null,
+    after: backwards ? null : cursor,
+    before: backwards ? cursor : null,
+    query: query || null,
+    sortKey,
+    reverse,
+    variantLimit: VARIANTS_PER_PRODUCT,
+    includeVariants: variantView,
+  });
+
+  const products = data.products.nodes.map((node) =>
+    toProductRow(node, filters, variantView),
+  );
+
+  return {
+    products,
+    pageInfo: data.products.pageInfo,
+    totalProducts: data.productsCount?.count ?? products.length,
+    totalIsLowerBound: data.productsCount?.precision !== "EXACT",
+    ...rowStats(products, variantView),
+    query,
+  };
+}
+
+/** Products pulled per scan request. 250 is the connection's ceiling. */
+const SCAN_PAGE_SIZE = 250;
+
+/**
+ * Ceiling on a single scan, in products. Twenty requests is already a slow
+ * page load; past this the total is reported as a lower bound ("5,000+") rather
+ * than making the merchant wait on a collection nobody bulk-edits in one go.
+ */
+const SCAN_PRODUCT_CAP = 5000;
+
+const SYNTHETIC_CURSOR = "amend:offset:";
+
+/**
+ * The collection path: `query` is a superset (see the table in `filters.ts`),
+ * so we page the whole thing and apply `residual` ourselves.
+ *
+ * That rules out Shopify's cursors — they index the unfiltered stream, not the
+ * rows the merchant ends up seeing — so this scans from the top and paginates
+ * over the narrowed list by offset. Scanning from the top each time is also
+ * what makes the total exact, which the select-all-matching flow leans on.
+ */
+async function scanProductPage(
+  admin: AdminApiContext,
+  { filters, sortKey, reverse, cursor }: FetchPageArgs,
+  query: string,
+  residual: ResidualFilters,
+): Promise<ProductPage> {
+  const variantView = filters.view === "variant";
+  const pageSize = variantView ? VARIANT_VIEW_PAGE_SIZE : PRODUCT_PAGE_SIZE;
+  const includeVariants = variantView || residualNeedsVariants(residual);
+
+  const matched: ProductNode[] = [];
+  let after: string | null = null;
+  let scanned = 0;
+  let truncated = false;
+
+  for (;;) {
+    const data: ProductPageResponse = await runPageQuery(admin, {
+      first: SCAN_PAGE_SIZE,
+      last: null,
+      after,
+      before: null,
       query: query || null,
       sortKey,
       reverse,
       variantLimit: VARIANTS_PER_PRODUCT,
-      includeVariants: variantView,
-    },
-  });
+      includeVariants,
+    });
 
+    for (const node of data.products.nodes) {
+      if (productMatchesResidual(toProductLike(node), residual)) {
+        matched.push(node);
+      }
+    }
+    scanned += data.products.nodes.length;
+
+    if (!data.products.pageInfo.hasNextPage) break;
+    if (scanned >= SCAN_PRODUCT_CAP) {
+      truncated = true;
+      break;
+    }
+    after = data.products.pageInfo.endCursor;
+  }
+
+  const offset = Math.min(
+    Math.max(0, decodeOffset(cursor)),
+    Math.max(0, matched.length - 1),
+  );
+  const products = matched
+    .slice(offset, offset + pageSize)
+    .map((node) => toProductRow(node, filters, variantView));
+
+  const hasNextPage = offset + pageSize < matched.length || truncated;
+  const hasPreviousPage = offset > 0;
+
+  return {
+    products,
+    pageInfo: {
+      hasNextPage,
+      hasPreviousPage,
+      startCursor: hasPreviousPage
+        ? `${SYNTHETIC_CURSOR}${Math.max(0, offset - pageSize)}`
+        : null,
+      endCursor: hasNextPage ? `${SYNTHETIC_CURSOR}${offset + pageSize}` : null,
+    },
+    totalProducts: matched.length,
+    totalIsLowerBound: truncated,
+    ...rowStats(products, variantView),
+    query,
+  };
+}
+
+function decodeOffset(cursor: string | null): number {
+  if (!cursor || !cursor.startsWith(SYNTHETIC_CURSOR)) return 0;
+  const offset = Number.parseInt(cursor.slice(SYNTHETIC_CURSOR.length), 10);
+  return Number.isFinite(offset) ? offset : 0;
+}
+
+function rowStats(products: ProductRow[], variantView: boolean) {
+  const rowIds = variantView
+    ? products.flatMap((product) => product.variants.map((v) => v.id))
+    : products.map((product) => product.id);
+  return { rowIds, variantsOnPage: variantView ? rowIds.length : 0 };
+}
+
+async function runPageQuery(
+  admin: AdminApiContext,
+  variables: Record<string, unknown>,
+): Promise<ProductPageResponse> {
+  const response = await admin.graphql(PRODUCT_PAGE_QUERY, { variables });
   const body = (await response.json()) as {
     data?: ProductPageResponse;
     errors?: { message: string }[];
@@ -181,24 +327,7 @@ export async function fetchProductPage(
   if (!body.data) {
     throw new Error("Shopify product search returned no data.");
   }
-
-  const products = body.data.products.nodes.map((node) =>
-    toProductRow(node, filters, variantView),
-  );
-
-  const rowIds = variantView
-    ? products.flatMap((product) => product.variants.map((v) => v.id))
-    : products.map((product) => product.id);
-
-  return {
-    products,
-    pageInfo: body.data.products.pageInfo,
-    totalProducts: body.data.productsCount?.count ?? products.length,
-    totalIsLowerBound: body.data.productsCount?.precision !== "EXACT",
-    rowIds,
-    variantsOnPage: variantView ? rowIds.length : 0,
-    query,
-  };
+  return body.data;
 }
 
 export async function fetchFacets(admin: AdminApiContext): Promise<Facets> {
@@ -264,6 +393,21 @@ interface FacetsResponse {
   productTags: { edges: { node: string }[] };
   collections: {
     nodes: { id: string; title: string; productsCount: { count: number } | null }[];
+  };
+}
+
+/** Adapts a raw node to the shape `productMatchesResidual` reads. */
+function toProductLike(node: ProductNode): ProductLike {
+  return {
+    title: node.title,
+    handle: node.handle,
+    vendor: node.vendor,
+    productType: node.productType,
+    tags: node.tags,
+    minPrice: node.priceRangeV2.minVariantPrice.amount,
+    maxPrice: node.priceRangeV2.maxVariantPrice.amount,
+    totalInventory: node.totalInventory,
+    variants: node.variants?.nodes ?? [],
   };
 }
 
