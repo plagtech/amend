@@ -80,6 +80,14 @@ const INSERT_CHUNK = 1_000;
 /** Jobs one drain pass will run before handing back. A runaway-loop backstop. */
 const MAX_DRAIN = 25;
 
+/**
+ * Attempts at the job-creation transaction before giving up.
+ *
+ * Only serialization failures are retried, and only a genuine tie produces one,
+ * so this never spins on a real error.
+ */
+const CREATE_ATTEMPTS = 3;
+
 export class PlanLimitError extends Error {}
 export class JobRequestError extends Error {}
 
@@ -104,25 +112,111 @@ export interface CreateApplyJobArgs {
   name: string;
   scope: JobScope;
   actions: EditAction[];
+  /**
+   * The key minted with the preview this apply confirms.
+   *
+   * Required, because without one there is nothing to tell a duplicate POST
+   * apart from a merchant deliberately applying the same edit twice — and
+   * guessing wrong in either direction is a worse failure than refusing.
+   */
+  idempotencyKey: string;
 }
 
 /**
- * Accept an edit and put it in the queue.
+ * The confirm POST arrived twice for the same preview.
+ *
+ * Not an error: the merchant asked for one edit and gets one edit. The caller
+ * hands back the original job's id and the browser lands on the same job page
+ * it would have anyway, none the wiser.
+ */
+async function jobForKey(
+  shopId: string,
+  idempotencyKey: string,
+): Promise<EditJob> {
+  const existing = await db.editJob.findFirst({
+    where: { shopId, idempotencyKey },
+  });
+  // Postgres blocks the second inserter until the first transaction resolves
+  // and only then raises the violation, so by the time we are here the winner
+  // has committed and this lookup cannot miss. If it somehow does, the honest
+  // answer is to say so rather than to quietly start a second edit.
+  if (!existing) {
+    throw new JobRequestError(
+      "That edit could not be confirmed. Run the preview again.",
+    );
+  }
+  return existing;
+}
+
+/**
+ * Accept an edit and put it in the queue, exactly once.
  *
  * Deliberately does no Shopify work: resolving the selection can take many
  * seconds on a large catalog, and the merchant should land on the job page
  * watching it happen rather than on a spinner waiting for a POST.
+ *
+ * Exactly once matters more here than the phrase usually implies. A duplicate
+ * apply is not a wasted call — it re-resolves the selection against the catalog
+ * the first one already changed, so a relative edit (price −10%) compounds, and
+ * the duplicate's snapshot records the discounted price as the before-value.
+ * Undo would then need two passes in the right order to get back. The unique
+ * index on `idempotencyKey` is what makes that unreachable.
  */
 export async function createApplyJob({
   shopId,
   name,
   scope,
   actions,
+  idempotencyKey,
 }: CreateApplyJobArgs): Promise<EditJob> {
   if (!actions.length) {
     throw new JobRequestError("Add at least one edit action before applying.");
   }
+  if (!idempotencyKey) {
+    throw new JobRequestError(
+      "This preview is stale. Run the preview again before applying.",
+    );
+  }
 
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await createApplyJobOnce({
+        shopId,
+        name,
+        scope,
+        actions,
+        idempotencyKey,
+      });
+    } catch (error) {
+      // The unique index did its job. The credit increment shared a
+      // transaction with the insert, so it rolled back too — a replayed apply
+      // costs the merchant nothing.
+      if (isPrismaError(error, "P2002")) {
+        return jobForKey(shopId, idempotencyKey);
+      }
+      // Two confirms landing in the same instant is the one case that reaches
+      // here, and under `Serializable` the loser is not always told it lost on
+      // the unique index — it can simply be told to retry. Retrying is what
+      // converts that into the violation above, which is the answer we want.
+      if (isPrismaError(error, "P2034") && attempt < CREATE_ATTEMPTS) continue;
+      throw error;
+    }
+  }
+}
+
+function isPrismaError(error: unknown, code: string): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError && error.code === code
+  );
+}
+
+function createApplyJobOnce({
+  shopId,
+  name,
+  scope,
+  actions,
+  idempotencyKey,
+}: CreateApplyJobArgs): Promise<EditJob> {
   return db.$transaction(
     async (tx) => {
       const shop = await tx.shop.upsert({
@@ -156,6 +250,7 @@ export async function createApplyJob({
           shopId,
           name,
           status: "queued",
+          idempotencyKey,
           filterJson: serializeScope(scope) as Prisma.InputJsonValue,
           actionsJson: actions as unknown as Prisma.InputJsonValue,
         },
@@ -439,7 +534,13 @@ async function applyDraftsFor(
 ): Promise<SnapshotDraft[]> {
   const scope = parseScope(job.filterJson);
   const actions = parseActions(JSON.stringify(job.actionsJson));
-  const { drafts } = await buildApplyDrafts(admin, scope, actions);
+  // Resolving a large catalog can run for minutes, and until this returns the
+  // job has not written a heartbeat since it claimed the slot. Past STALE_MS
+  // that reads as a crash, and the sweep would requeue a job that is working
+  // perfectly well — so the scan beats as it pages.
+  const { drafts } = await buildApplyDrafts(admin, scope, actions, {
+    onProgress: heartbeat(job.id),
+  });
   return drafts;
 }
 
@@ -780,8 +881,17 @@ export async function handleBulkFinish(
  * reconciled by polling its operation — that also covers a webhook that never
  * arrived, which is why the bulk path works in local development without a
  * public callback URL.
+ *
+ * There is no scheduled sweep behind this (SPEC §5). Jobs make progress when a
+ * loader or a webhook fires, and nothing else moves them.
  */
 export async function resumeStalledJobs(shopId: string): Promise<void> {
+  await resumeActiveJobs(shopId);
+  await resumeOrphanedQueue(shopId);
+}
+
+/** Jobs that were mutating, or about to, and stopped saying so. */
+async function resumeActiveJobs(shopId: string): Promise<void> {
   const stale = new Date(Date.now() - STALE_MS);
   const jobs = await db.editJob.findMany({
     where: {
@@ -811,6 +921,48 @@ export async function resumeStalledJobs(shopId: string): Promise<void> {
     });
     runJobDetached(shopId, job.id);
   }
+}
+
+/**
+ * Pick up a job that is queued and has nobody coming for it.
+ *
+ * `resumeActiveJobs` only looks at `snapshotting` and `running`, which misses
+ * the case where the process died between `createApplyJob` committing and
+ * `claimRunSlot` taking the slot — or where `drainQueue` returned early because
+ * a bulk stage held the slot, and the reconcile that should have drained it
+ * never happened. Such a job is not stalled, it is invisible: no heartbeat ever
+ * started, so no staleness check based on one can see it.
+ *
+ * The shop's slot is not bypassed. This only re-enters the job through
+ * `runJobDetached`, which still has to win `claimRunSlot` like anything else —
+ * and the `active` check first means a job legitimately waiting behind a
+ * long-running edit is left alone however long it waits.
+ */
+async function resumeOrphanedQueue(shopId: string): Promise<void> {
+  const active = await db.editJob.count({
+    where: { shopId, status: { in: ["snapshotting", "running"] } },
+  });
+  if (active > 0) return;
+
+  const stale = new Date(Date.now() - STALE_MS);
+  const orphan = await db.editJob.findFirst({
+    where: { shopId, status: "queued", updatedAt: { lt: stale } },
+    orderBy: { createdAt: "asc" },
+  });
+  if (!orphan) return;
+
+  // Claim by bumping the row, so the job page polling every two seconds does
+  // not fire a fresh attempt on every tick while the first one is still
+  // resolving its selection. `updatedAt` moves with this write, which is what
+  // takes the job back out of the query above.
+  const claimed = await db.editJob.updateMany({
+    where: { id: orphan.id, status: "queued", updatedAt: orphan.updatedAt },
+    data: { heartbeatAt: new Date() },
+  });
+  if (claimed.count === 0) return;
+
+  // One is enough: `runJob` drains the rest of the shop's queue behind it.
+  runJobDetached(shopId, orphan.id);
 }
 
 function reconcileDetached(shop: string, jobId: string): void {

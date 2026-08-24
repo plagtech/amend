@@ -89,6 +89,8 @@ model EditJob {
   createdAt    DateTime @default(now())
   completedAt  DateTime?
   snapshots    Snapshot[]
+  idempotencyKey String? @unique          // minted with the preview, spent by Apply
+  updatedAt    DateTime @updatedAt        // lets the sweep see an orphaned queued job
 }
 
 model Snapshot {
@@ -131,8 +133,13 @@ Snapshot retention: cron deletes snapshots > 90 days old (free) / > 365 days (pr
 **Invariants:**
 - Never begin mutations until 100% of snapshots are persisted. Undo integrity is the brand.
 - Jobs are idempotent/resumable: each Snapshot row tracks `applied`, so a crashed worker resumes without double-applying.
+- **Apply itself is idempotent, not just the rows inside it.** Every preview mints an `idempotencyKey`; the confirm POST sends it back and the unique index on `EditJob.idempotencyKey` turns a replayed confirm into a lookup of the job the first one created. This is not merely tidy — a duplicate job re-resolves the selection against the catalog the first job already changed, so a relative edit (price −10%) compounds and the duplicate's snapshot records the *discounted* price as its before-value, which takes two undos in the right order to unwind. A deliberate second application of the same edit still works: it goes through a second preview, and so a second key.
 - Only one running job per shop at a time (queue others) — prevents conflicting edits and confusing undo semantics. Surface this in UI: "Queued behind: Price update (running)."
 - If a product was modified externally between snapshot and undo, undo still applies the snapshot but flags the row: "value had changed since edit."
+
+**Progress model — request-time only (accepted for now).** There is no cron, worker, or scheduler. A job moves only when something calls into the engine: a loader on the dashboard or a job page (both run `resumeStalledJobs`), the `bulk_operations/finish` webhook, or `drainQueue` running in-process behind a job that just finished. The sweep covers both shapes of stall — a job that was `snapshotting`/`running` and went quiet, and one orphaned in `queued` by a process that died before claiming the slot — but neither is noticed until somebody loads a page or a webhook lands. In practice this means a bulk job whose webhook never arrives waits for the merchant to come back and look at it. That is a deliberate trade for v1: it keeps the deploy a single web service. **A scheduled sweep is a Phase 6 item, alongside the Railway deploy work.**
+
+**Known issue — `reconcileBulkJob` can be entered twice.** It is reachable from the `bulk_operations/finish` webhook and from the stale sweep with no claim between them, so a webhook arriving while a sweep-triggered reconcile is already in flight can run both concurrently. `settleBulkResults` is safe under this — it only touches rows that are still `applied: false, error: null` — but the `advanceBulk` call that follows is not: both entries can decide the same next stage still has pending rows and each call `startBulkStage`, producing a duplicate `bulkOperationRunMutation` for that stage and a `bulkOpGid` on the job that points at whichever wrote last, orphaning the other operation's results. Rows already applied are not re-sent and the mutations are absolute rather than relative, so the catalog outcome is not corrupted; the cost is a wasted bulk operation and a job that can strand rows waiting on a webhook for a GID it is no longer tracking. Fix is a claim around the reconcile, the same shape as `claimRunSlot`. Not addressed yet.
 
 ---
 
@@ -193,7 +200,7 @@ Pricing principle: do not go below $19 — in this category cheap signals fragil
 
 **Phase 5 — Remaining actions (days 10-11):** title/description find-replace, SEO fields, inventory, vendor/type, SKU/barcode/weight. Templates page.
 
-**Phase 6 — Billing + polish (days 12-13):** Billing API, plan gating, scheduling + auto-revert (BullMQ delayed jobs), empty states, error states, seed-store QA at 1,000 products.
+**Phase 6 — Billing + polish (days 12-13):** Billing API, plan gating, scheduling + auto-revert (BullMQ delayed jobs), empty states, error states, seed-store QA at 1,000 products. Also: the scheduled sweep that §5 defers — a periodic `resumeStalledJobs` across shops, so a job no longer waits on someone opening the app — and a claim around `reconcileBulkJob`.
 
 **Phase 7 — Submission (day 14):** listing assets, privacy policy, review checklist pass, submit.
 

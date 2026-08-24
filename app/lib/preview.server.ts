@@ -43,6 +43,12 @@ export interface BuildPreviewArgs {
    * and a truncated row list is exactly how that bug would happen.
    */
   rowLimit?: number;
+  /**
+   * Called as the product scan pages. Preview itself has no use for it — this
+   * exists so APPLY, which runs the same scan across a whole catalog inside a
+   * claimed job slot, can keep its heartbeat current while it waits.
+   */
+  onProgress?: () => void | Promise<void>;
 }
 
 export interface PreviewResult {
@@ -87,6 +93,7 @@ export async function buildPreview(
     sortKey,
     reverse,
     rowLimit = PREVIEW_ROW_LIMIT,
+    onProgress,
   }: BuildPreviewArgs,
 ): Promise<PreviewResult> {
   const live = actions.filter(isActionComplete);
@@ -104,6 +111,7 @@ export async function buildPreview(
     includeVariants,
     cap: PREVIEW_PRODUCT_CAP,
     pageSize: includeVariants ? PREVIEW_PAGE_WITH_VARIANTS : undefined,
+    onPage: onProgress,
   });
 
   const rows: PreviewRow[] = [];

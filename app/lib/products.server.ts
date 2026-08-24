@@ -279,6 +279,15 @@ export interface CollectArgs {
   cap?: number;
   /** Products per request. Lower it when variants make each node expensive. */
   pageSize?: number;
+  /**
+   * Called after each page comes back.
+   *
+   * A whole-catalog scan is the longest thing this app does without writing
+   * anything, and a caller holding a job slot needs some way to say it is still
+   * alive while it waits. Awaited, so a slow observer throttles the scan rather
+   * than piling up behind it.
+   */
+  onPage?: () => void | Promise<void>;
 }
 
 /**
@@ -292,7 +301,15 @@ export interface CollectArgs {
  */
 export async function collectMatchingProducts(
   admin: AdminApiContext,
-  { filters, sortKey, reverse, includeVariants, cap, pageSize }: CollectArgs,
+  {
+    filters,
+    sortKey,
+    reverse,
+    includeVariants,
+    cap,
+    pageSize,
+    onPage,
+  }: CollectArgs,
 ): Promise<{ products: ProductNode[]; truncated: boolean }> {
   const plan = planProductQuery(filters);
   const limit = cap ?? SCAN_PRODUCT_CAP;
@@ -326,6 +343,7 @@ export async function collectMatchingProducts(
       products.push(node);
     }
     scanned += data.products.nodes.length;
+    if (onPage) await onPage();
 
     if (!data.products.pageInfo.hasNextPage) break;
     if (scanned >= limit) {

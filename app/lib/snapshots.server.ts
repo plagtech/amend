@@ -97,6 +97,18 @@ export interface ApplyDrafts {
   preview: PreviewResult;
 }
 
+export interface BuildApplyOptions {
+  /**
+   * Called as the scan pages through the catalog.
+   *
+   * APPLY passes its job heartbeat here. Resolving a large selection can run
+   * for minutes, and a job that says nothing for that long is indistinguishable
+   * from a crashed one to the stale sweep — which would then requeue an edit
+   * that is proceeding perfectly well.
+   */
+  onProgress?: () => void | Promise<void>;
+}
+
 /**
  * The before-picture for an APPLY job.
  *
@@ -108,6 +120,7 @@ export async function buildApplyDrafts(
   admin: AdminApiContext,
   scope: JobScope,
   actions: EditAction[],
+  { onProgress }: BuildApplyOptions = {},
 ): Promise<ApplyDrafts> {
   const preview = await buildPreview(admin, {
     filters: scope.filters,
@@ -116,6 +129,7 @@ export async function buildApplyDrafts(
     sortKey: scope.sortKey,
     reverse: scope.reverse,
     rowLimit: Number.POSITIVE_INFINITY,
+    onProgress,
   });
 
   if (preview.truncated) {

@@ -19,6 +19,7 @@
  * Assumes `npm run seed` has been run and the catalog is unedited.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -474,11 +475,14 @@ async function main(): Promise<void> {
       reverse: false,
     };
 
+    // The key the browser would have received with its preview.
+    const applyKey = randomUUID();
     const job = await createApplyJob({
       shopId: shop,
       name: jobName(EDIT, "verify"),
       scope,
       actions: EDIT,
+      idempotencyKey: applyKey,
     });
     created.push(job.id);
     const applied = await runToCompletion(admin, job.id);
@@ -512,13 +516,14 @@ async function main(): Promise<void> {
 
     console.log("\nStore state after apply:");
     const afterApply = await readStore(admin, inScope);
+    const expectedOnce = fingerprint(
+      expectedAfterApply(before, new Set(selectedIds), excludedProduct),
+      inScope,
+    );
     check(
       "catalog matches the edit exactly",
       fingerprint(afterApply, inScope),
-      fingerprint(
-        expectedAfterApply(before, new Set(selectedIds), excludedProduct),
-        inScope,
-      ),
+      expectedOnce,
     );
     assertTrue(
       "the excluded row kept its tags while its prices still moved",
@@ -534,6 +539,57 @@ async function main(): Promise<void> {
       "unselected products in the same filter were untouched",
       fingerprint(afterApply, untouchedIds),
       fingerprint(before, untouchedIds),
+    );
+
+    // --- idempotency: the confirm POST arrives twice -----------------------
+    // The failure this exists to prevent is not a wasted call. A second job
+    // would re-resolve the selection against the catalog the first one already
+    // discounted, take another 15% off, and record the discounted price as its
+    // before-value — leaving a catalog that needs two undos, in the right
+    // order, to recover. So this asserts the store, not just the row count.
+    console.log("\nIdempotency — the same confirm POST, replayed:");
+    const replay = await createApplyJob({
+      shopId: shop,
+      name: jobName(EDIT, "verify"),
+      scope,
+      actions: EDIT,
+      idempotencyKey: applyKey,
+    });
+    // The route fires this after every apply, replay or not.
+    await runJob(admin, replay.id);
+
+    check("the replay resolved to the original job", replay.id, job.id);
+    check(
+      "exactly one job exists for the key",
+      await db.editJob.count({
+        where: { shopId: shop, idempotencyKey: applyKey },
+      }),
+      1,
+    );
+    check(
+      "no second job was queued behind it",
+      await db.editJob.count({
+        where: {
+          shopId: shop,
+          status: { in: ["queued", "snapshotting", "running"] },
+        },
+      }),
+      0,
+    );
+    check(
+      "the replay consumed no second credit",
+      (await db.shop.findUnique({ where: { id: shop } }))?.jobsThisMonth,
+      1,
+    );
+    check(
+      "no second snapshot set was written",
+      await db.snapshot.count({ where: { jobId: job.id } }),
+      expectedRows,
+    );
+    check(
+      "the catalog still shows one application, not two",
+      fingerprint(await readStore(admin, inScope), inScope),
+      expectedOnce,
     );
 
     // --- undo --------------------------------------------------------------

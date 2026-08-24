@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
@@ -121,6 +123,18 @@ export interface ApplyResponse {
 }
 
 /**
+ * A preview, plus the one key that can turn it into a write.
+ *
+ * Minted per preview rather than per page load, because the preview is the unit
+ * the merchant actually approves: change the filter, the selection or the
+ * actions and the diff table is invalidated, a new preview is required, and
+ * that new preview carries a new key. A second deliberate application of the
+ * same edit therefore still works — it goes through a second preview. What
+ * cannot happen is the *same* approved diff being applied twice.
+ */
+export type PreviewResponse = PreviewResult & { idempotencyKey: string };
+
+/**
  * Preview and Apply. Both POSTed rather than folded into the loader because the
  * selection can be thousands of ids — that belongs in a body, not a URL — and
  * because both are explicit, comparatively expensive steps the merchant asks
@@ -131,6 +145,11 @@ export interface ApplyResponse {
  * selection and recomputes every value with the same code that produced the
  * preview, so a tampered or stale row list cannot become a write. Everything
  * past creating the job happens in the background — see `apply.server.ts`.
+ *
+ * Apply also posts back the key its preview was issued with. A confirm POST
+ * that arrives twice for one preview — a retried fetch, a second tab, a
+ * double-submit — resolves to the job the first one created and navigates to
+ * the same page. The merchant sees one edit because there is one edit.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -142,6 +161,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     sort?: string;
     excluded?: unknown;
     scopeLabel?: string;
+    idempotencyKey?: string;
   };
 
   const filters = parseFilters(new URLSearchParams(body.filters ?? ""));
@@ -167,6 +187,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         name: jobName(actions, String(body.scopeLabel ?? "").slice(0, 60)),
         scope,
         actions,
+        idempotencyKey:
+          typeof body.idempotencyKey === "string" ? body.idempotencyKey : "",
       });
       runJobDetached(session.shop, job.id);
       return { jobId: job.id, error: null } satisfies ApplyResponse;
@@ -178,13 +200,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  return buildPreview(admin, {
+  const preview = await buildPreview(admin, {
     filters,
     actions,
     selection,
     sortKey,
     reverse,
   });
+  // The key rides back with the diff the merchant is about to approve, and is
+  // spent by whichever confirm POST reaches the server first.
+  return { ...preview, idempotencyKey: randomUUID() } satisfies PreviewResponse;
 };
 
 export default function NewBulkEdit() {
@@ -225,7 +250,7 @@ export default function NewBulkEdit() {
 
   // --- preview --------------------------------------------------------------
 
-  const previewFetcher = useFetcher<PreviewResult>();
+  const previewFetcher = useFetcher<PreviewResponse>();
 
   /**
    * Identity of what a preview describes. Any change to the filter, the
@@ -289,6 +314,10 @@ export default function NewBulkEdit() {
   const applying = applyFetcher.state !== "idle";
 
   const runApply = useCallback(() => {
+    // `canApply` already gates the button on a live preview; this is the same
+    // condition restated where the key is actually read, so a future caller
+    // cannot reach the POST without one.
+    if (!preview) return;
     setConfirming(false);
     applyFetcher.submit(
       {
@@ -299,11 +328,15 @@ export default function NewBulkEdit() {
         sort,
         excluded,
         scopeLabel: describeScope(filters, facets.collections),
+        // Spent by the first POST to arrive. A replay of this exact body lands
+        // back on the job that POST created rather than starting a second one.
+        idempotencyKey: preview.idempotencyKey,
       },
       { method: "POST", encType: "application/json" },
     );
   }, [
     applyFetcher,
+    preview,
     filters,
     actions,
     selection.selection,

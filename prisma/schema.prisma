@@ -60,6 +60,17 @@ model EditJob {
   completedAt  DateTime?
   snapshots    Snapshot[]
 
+  // The browser is handed this with its preview and sends it back with Apply,
+  // so a confirm POST that arrives twice — a retried fetch, a second tab, a
+  // double-submit — resolves to the job the first one created instead of
+  // queueing a duplicate edit that compounds on it. Nullable: undo and retry
+  // jobs are not created from a preview, and neither is any pre-existing row.
+  idempotencyKey String?  @unique
+  // Last write to this row. `heartbeatAt` only moves while a job is actively
+  // running, so it cannot tell a freshly queued job from one orphaned by a
+  // process that died before claiming the slot. This can.
+  updatedAt      DateTime @updatedAt @default(now())
+
   // --- Phase 4: the job engine ---------------------------------------------
   // How the mutations run. "sync" batches them inline; "bulk" stages a JSONL
   // upload and waits on the bulk_operations/finish webhook.
@@ -76,6 +87,8 @@ model EditJob {
 
   @@index([shopId])
   @@index([shopId, status])
+  // The orphaned-queue sweep: queued jobs for one shop, oldest first.
+  @@index([shopId, status, updatedAt])
 }
 
 model Snapshot {
