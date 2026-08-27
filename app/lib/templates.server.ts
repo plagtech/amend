@@ -18,6 +18,7 @@ import type { SavedTemplate } from "@prisma/client";
 import db from "../db.server";
 import type { EditAction } from "./actions";
 import { parseActions, serializeActions } from "./actions";
+import { planFor, usableTemplateIds } from "./billing.server";
 import { FREE_TEMPLATE_LIMIT, describeActions } from "./jobs";
 import type { SelectFilters } from "./filters";
 import { parseFilters, serializeFilters } from "./filters";
@@ -95,6 +96,14 @@ export interface TemplateView {
   /** Link that opens the wizard with this template's filter and actions loaded. */
   href: string;
   createdAt: string;
+  /**
+   * True when the shop's plan no longer covers this template.
+   *
+   * Read-only, not gone: it still lists, still shows what it would do, and
+   * comes back the moment the shop upgrades or deletes enough to fit under the
+   * cap (SPEC §7). Enforced by `openTemplate`, not by hiding the button.
+   */
+  locked: boolean;
 }
 
 /**
@@ -110,6 +119,14 @@ export async function listTemplates(shopId: string): Promise<TemplateView[]> {
     orderBy: { createdAt: "desc" },
   });
 
+  // Which ones the plan still covers. Computed from oldest first, so the answer
+  // does not shuffle when a template is added or deleted.
+  const usable = usableTemplateIds(
+    await planFor(shopId),
+    [...rows].reverse(),
+    FREE_TEMPLATE_LIMIT,
+  );
+
   return rows.map((row) => {
     const filters = parseFilters(new URLSearchParams(readString(row.filterJson)));
     const actions = parseActions(readString(row.actionsJson));
@@ -123,8 +140,32 @@ export async function listTemplates(shopId: string): Promise<TemplateView[]> {
       scope: describeFilters(filters),
       href: `/app/edit/new?${params.toString()}`,
       createdAt: row.createdAt.toISOString(),
+      locked: !usable.has(row.id),
     };
   });
+}
+
+/**
+ * Resolve a template into the wizard link that runs it — or refuse.
+ *
+ * This exists so that "you can view it but not run it" is a server-side fact.
+ * The Use button posts here rather than linking straight to the wizard, because
+ * a link is not a gate: anyone can type the URL. The refusal is the same shape
+ * as every other plan refusal, so the page can show the message it comes with.
+ */
+export async function openTemplate(
+  shopId: string,
+  templateId: string,
+): Promise<string> {
+  const templates = await listTemplates(shopId);
+  const template = templates.find((entry) => entry.id === templateId);
+  if (!template) throw new TemplateError("That template no longer exists.");
+  if (template.locked) {
+    throw new TemplateError(
+      `The free plan runs ${FREE_TEMPLATE_LIMIT} saved templates. This one is kept and readable — upgrade, or delete a newer template, to run it again.`,
+    );
+  }
+  return template.href;
 }
 
 /**

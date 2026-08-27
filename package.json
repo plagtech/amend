@@ -20,7 +20,11 @@
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
-    "verify:apply": "tsx scripts/verify-apply.ts"
+    "verify:apply": "tsx scripts/verify-apply.ts",
+    "verify:plan": "tsx scripts/verify-plan.ts",
+    "verify:schedule": "tsx scripts/verify-schedule.ts",
+    "verify:billing": "tsx scripts/verify-billing.ts",
+    "verify:deploy": "tsx scripts/verify-deploy.ts"
   },
   "type": "module",
   "engines": {

@@ -9,8 +9,10 @@
  */
 
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import { redirect } from "@remix-run/node";
 import { useFetcher, useLoaderData } from "@remix-run/react";
 import {
+  Badge,
   Banner,
   BlockStack,
   Box,
@@ -27,7 +29,12 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { FREE_TEMPLATE_LIMIT } from "../lib/jobs";
-import { deleteTemplate, listTemplates } from "../lib/templates.server";
+import {
+  TemplateError,
+  deleteTemplate,
+  listTemplates,
+  openTemplate,
+} from "../lib/templates.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -44,12 +51,30 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const form = await request.formData();
+  const intent = form.get("intent");
+  const id = String(form.get("id") ?? "");
 
-  if (form.get("intent") === "delete") {
-    await deleteTemplate(session.shop, String(form.get("id") ?? ""));
-    return { ok: true };
+  if (intent === "delete") {
+    await deleteTemplate(session.shop, id);
+    return { ok: true, error: null };
   }
-  return { ok: false };
+
+  // "Use" is a POST, not a link, so the plan check happens on the server. A
+  // locked template is readable but not runnable, and typing the wizard URL by
+  // hand does not change that — the wizard's own quota and regex gates still
+  // apply to whatever is built there.
+  if (intent === "use") {
+    try {
+      return redirect(await openTemplate(session.shop, id));
+    } catch (error) {
+      if (error instanceof TemplateError) {
+        return { ok: false, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  return { ok: false, error: null };
 };
 
 export default function Templates() {
@@ -69,12 +94,22 @@ export default function Templates() {
       <Layout>
         <Layout.Section>
           <BlockStack gap="400">
+            {fetcher.data?.error ? (
+              <Banner tone="warning" title="This template is read-only">
+                <p>{fetcher.data.error}</p>
+              </Banner>
+            ) : null}
+
             {atLimit ? (
-              <Banner tone="info" title="Template limit reached">
+              <Banner
+                tone="info"
+                title="Template limit reached"
+                action={{ content: "See plans", url: "/app/settings" }}
+              >
                 <p>
-                  The free plan keeps {FREE_TEMPLATE_LIMIT} saved templates.
-                  Delete one to save another — every saved edit still runs, and
-                  undo is free on any plan.
+                  The free plan runs {FREE_TEMPLATE_LIMIT} saved templates.
+                  Anything past that is kept and readable but marked read-only —
+                  nothing is ever deleted. Undo stays free on any plan.
                 </p>
               </Banner>
             ) : null}
@@ -109,9 +144,14 @@ export default function Templates() {
                         wrap
                       >
                         <BlockStack gap="100">
-                          <Text as="h2" variant="headingSm">
-                            {template.name}
-                          </Text>
+                          <InlineStack gap="200" blockAlign="center">
+                            <Text as="h2" variant="headingSm">
+                              {template.name}
+                            </Text>
+                            {template.locked ? (
+                              <Badge tone="attention">Read-only</Badge>
+                            ) : null}
+                          </InlineStack>
                           <Text as="p" variant="bodySm">
                             {template.summary}
                           </Text>
@@ -120,7 +160,21 @@ export default function Templates() {
                           </Text>
                         </BlockStack>
                         <InlineStack gap="200">
-                          <Button variant="primary" url={template.href}>
+                          <Button
+                            variant="primary"
+                            disabled={template.locked}
+                            loading={
+                              fetcher.state !== "idle" &&
+                              fetcher.formData?.get("intent") === "use" &&
+                              fetcher.formData?.get("id") === template.id
+                            }
+                            onClick={() =>
+                              fetcher.submit(
+                                { intent: "use", id: template.id },
+                                { method: "POST" },
+                              )
+                            }
+                          >
                             Use
                           </Button>
                           <Button

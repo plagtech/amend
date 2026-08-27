@@ -280,11 +280,17 @@ export default function Index() {
                       <Text as="p" variant="bodySm" tone="subdued">
                         Undo is always free and never counts against your limit.
                       </Text>
+                      <Button url="/app/settings">See Pro</Button>
                     </BlockStack>
                   ) : (
-                    <Text as="p" variant="bodyMd">
-                      Unlimited jobs, scheduling, and 365-day undo retention.
-                    </Text>
+                    <BlockStack gap="200">
+                      <Text as="p" variant="bodyMd">
+                        Unlimited jobs, scheduling, and 365-day undo retention.
+                      </Text>
+                      <Button url="/app/settings" variant="tertiary">
+                        Manage plan
+                      </Button>
+                    </BlockStack>
                   )}
                 </BlockStack>
               </Card>

@@ -37,6 +37,7 @@ import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import {
   JobRequestError,
+  cancelScheduledJob,
   createUndoJob,
   resumeStalledJobs,
   retryFailedRows,
@@ -44,6 +45,7 @@ import {
 } from "../lib/apply.server";
 import {
   isActive,
+  isPending,
   jobStatusLabel,
   jobStatusTone,
 } from "../lib/jobs";
@@ -152,6 +154,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       isUndo: Boolean(job.undoOfJobId),
       createdAt: job.createdAt.toISOString(),
       completedAt: job.completedAt?.toISOString() ?? null,
+      scheduledFor: job.scheduledFor?.toISOString() ?? null,
+      revertAt: job.revertAt?.toISOString() ?? null,
     },
     counts: { applied, failed, drifted, total },
     rows: rowViews,
@@ -175,6 +179,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       const undo = await createUndoJob(shopId, jobId);
       runJobDetached(shopId, undo.id);
       return redirect(`/app/jobs/${undo.id}`);
+    }
+    if (intent === "cancelSchedule") {
+      await cancelScheduledJob(shopId, jobId);
+      return { ok: true, error: null };
     }
     if (intent === "retry") {
       const job = await retryFailedRows(shopId, jobId);
@@ -264,7 +272,18 @@ export default function JobDetail() {
       }
       subtitle={subtitle(job, counts)}
       primaryAction={
-        canUndo
+        isPending(job.status)
+          ? {
+              content: "Cancel this schedule",
+              destructive: true,
+              onAction: () =>
+                fetcher.submit(
+                  { intent: "cancelSchedule" },
+                  { method: "POST" },
+                ),
+              loading: busy,
+            }
+          : canUndo
           ? {
               content: undoJob ? "View undo" : "Undo this edit",
               url: undoJob ? `/app/jobs/${undoJob.id}` : undefined,
@@ -432,11 +451,49 @@ function StatusBanner({
   undoJob,
   original,
 }: {
-  job: { status: string; error: string | null; isUndo: boolean };
+  job: {
+    status: string;
+    error: string | null;
+    isUndo: boolean;
+    scheduledFor: string | null;
+    revertAt: string | null;
+  };
   counts: { applied: number; failed: number; drifted: number };
   undoJob: { id: string; name: string; status: string } | null;
   original: { id: string; name: string } | null;
 }) {
+  if (job.status === "scheduled") {
+    return (
+      <Banner tone="info" title="Scheduled">
+        <p>
+          This edit runs on{" "}
+          <strong>
+            {job.scheduledFor
+              ? new Date(job.scheduledFor).toLocaleString()
+              : "its scheduled date"}
+          </strong>
+          . Nothing has been resolved yet — when it runs it finds whatever
+          matches its filter at that moment, records the before-values, and only
+          then writes.
+          {job.revertAt
+            ? ` It undoes itself on ${new Date(job.revertAt).toLocaleString()}.`
+            : ""}
+        </p>
+      </Banner>
+    );
+  }
+
+  if (job.status === "cancelled") {
+    return (
+      <Banner tone="info" title="Cancelled before it ran">
+        <p>
+          This edit was called off while it was still scheduled. Nothing was
+          written, and no bulk edit was counted against your plan.
+        </p>
+      </Banner>
+    );
+  }
+
   if (job.status === "snapshotting") {
     return (
       <Banner tone="info" title="Recording the before-values">

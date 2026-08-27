@@ -42,6 +42,7 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import db from "../db.server";
 import type { EditAction } from "./actions";
 import { parseActions } from "./actions";
+import { PlanLimitError, assertActionsAllowed } from "./billing.server";
 import { fetchBulkOperation, fetchBulkResults, startBulkStage } from "./bulk.server";
 import {
   CYCLE_DAYS,
@@ -88,7 +89,9 @@ const MAX_DRAIN = 25;
  */
 const CREATE_ATTEMPTS = 3;
 
-export class PlanLimitError extends Error {}
+// Defined with the plans it belongs to; re-exported because every caller of the
+// engine already reaches for it here.
+export { PlanLimitError };
 export class JobRequestError extends Error {}
 
 /**
@@ -105,6 +108,16 @@ async function adminFor(shop: string): Promise<AdminApiContext> {
   return admin;
 }
 
+/**
+ * How a background caller gets an admin client for a shop.
+ *
+ * The same seam, one level up: `runJob` takes its admin as an argument so a
+ * script can drive the engine with nothing but an API token, and this lets the
+ * *scheduler* be driven the same way — otherwise "a scheduled job fires on its
+ * own" could only be tested by installing the app and waiting.
+ */
+export type AdminResolver = (shop: string) => Promise<AdminApiContext>;
+
 // --- creating jobs ----------------------------------------------------------
 
 export interface CreateApplyJobArgs {
@@ -120,6 +133,18 @@ export interface CreateApplyJobArgs {
    * guessing wrong in either direction is a worse failure than refusing.
    */
   idempotencyKey: string;
+  /**
+   * When to run it, or null for now (SPEC §3, sale windows).
+   *
+   * A scheduled job resolves nothing at creation time: it stores the same
+   * filter and actions as any other job and goes through the identical
+   * snapshot-then-mutate pipeline when it fires, against the catalog as it is
+   * then. Pre-resolving would freeze a selection that the merchant expects to
+   * be evaluated on the day.
+   */
+  scheduledFor?: Date | null;
+  /** Optional automatic undo, for a sale that ends by itself. */
+  revertAt?: Date | null;
 }
 
 /**
@@ -168,6 +193,8 @@ export async function createApplyJob({
   scope,
   actions,
   idempotencyKey,
+  scheduledFor = null,
+  revertAt = null,
 }: CreateApplyJobArgs): Promise<EditJob> {
   if (!actions.length) {
     throw new JobRequestError("Add at least one edit action before applying.");
@@ -186,6 +213,8 @@ export async function createApplyJob({
         scope,
         actions,
         idempotencyKey,
+        scheduledFor,
+        revertAt,
       });
     } catch (error) {
       // The unique index did its job. The credit increment shared a
@@ -210,12 +239,68 @@ function isPrismaError(error: unknown, code: string): boolean {
   );
 }
 
+/**
+ * Check the shop's monthly allowance and spend one credit, inside a caller's
+ * transaction.
+ *
+ * Shared by the immediate path (spent as the job is created) and the scheduler
+ * (spent when a scheduled job actually fires, not when it was set up — SPEC §7:
+ * an edit that never runs should not cost anything, and a plan can change
+ * between scheduling and firing).
+ *
+ * Throws `PlanLimitError` with a message written for the merchant.
+ */
+async function spendJobCredit(
+  tx: Prisma.TransactionClient,
+  shopId: string,
+): Promise<void> {
+  const shop = await tx.shop.upsert({
+    where: { id: shopId },
+    create: { id: shopId },
+    update: {},
+  });
+
+  // The usage cycle rolls lazily — a shop that doesn't visit doesn't need a
+  // cron to reset its counter.
+  const cycleEnd = new Date(shop.cycleStart);
+  cycleEnd.setDate(cycleEnd.getDate() + CYCLE_DAYS);
+  const rolled = cycleEnd <= new Date();
+  const used = rolled ? 0 : shop.jobsThisMonth;
+
+  if (shop.plan === "free" && used >= FREE_JOB_LIMIT) {
+    throw new PlanLimitError(
+      `You have used all ${FREE_JOB_LIMIT} bulk edits included this month. Undo stays available on every plan.`,
+    );
+  }
+
+  await tx.shop.update({
+    where: { id: shopId },
+    data: rolled
+      ? { jobsThisMonth: 1, cycleStart: new Date() }
+      : { jobsThisMonth: { increment: 1 } },
+  });
+}
+
+/**
+ * Spend a credit for a job that is firing now, outside any other transaction.
+ *
+ * Serializable for the same reason the create path is: the check and the
+ * increment have to be one decision.
+ */
+export async function spendCreditForScheduledJob(shopId: string): Promise<void> {
+  await db.$transaction((tx) => spendJobCredit(tx, shopId), {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  });
+}
+
 function createApplyJobOnce({
   shopId,
   name,
   scope,
   actions,
   idempotencyKey,
+  scheduledFor = null,
+  revertAt = null,
 }: CreateApplyJobArgs): Promise<EditJob> {
   return db.$transaction(
     async (tx) => {
@@ -225,31 +310,24 @@ function createApplyJobOnce({
         update: {},
       });
 
-      // The usage cycle rolls lazily — there is no cron, and a shop that
-      // doesn't visit doesn't need one.
-      const cycleEnd = new Date(shop.cycleStart);
-      cycleEnd.setDate(cycleEnd.getDate() + CYCLE_DAYS);
-      const rolled = cycleEnd <= new Date();
-      const used = rolled ? 0 : shop.jobsThisMonth;
+      // Server-side, and on the write path rather than only on the preview:
+      // the browser posts the actions, so this is the only place refusing them
+      // means anything.
+      assertActionsAllowed(shop.plan === "pro" ? "pro" : "free", actions);
 
-      if (shop.plan === "free" && used >= FREE_JOB_LIMIT) {
-        throw new PlanLimitError(
-          `You have used all ${FREE_JOB_LIMIT} bulk edits included this month. Undo stays available on every plan.`,
-        );
-      }
-
-      await tx.shop.update({
-        where: { id: shopId },
-        data: rolled
-          ? { jobsThisMonth: 1, cycleStart: new Date() }
-          : { jobsThisMonth: { increment: 1 } },
-      });
+      // A scheduled job spends nothing yet. The quota is checked and the credit
+      // taken when it fires, so a plan that changes in between is respected and
+      // an edit cancelled before its time costs the merchant nothing.
+      const scheduled = scheduledFor !== null && scheduledFor > new Date();
+      if (!scheduled) await spendJobCredit(tx, shopId);
 
       return tx.editJob.create({
         data: {
           shopId,
           name,
-          status: "queued",
+          status: scheduled ? "scheduled" : "queued",
+          scheduledFor: scheduled ? scheduledFor : null,
+          revertAt,
           idempotencyKey,
           filterJson: serializeScope(scope) as Prisma.InputJsonValue,
           actionsJson: actions as unknown as Prisma.InputJsonValue,
@@ -275,6 +353,11 @@ export async function createUndoJob(
 ): Promise<EditJob> {
   const original = await db.editJob.findFirst({ where: { id: jobId, shopId } });
   if (!original) throw new JobRequestError("That job no longer exists.");
+  if (original.status === "scheduled") {
+    throw new JobRequestError(
+      "This edit has not run yet. Cancel the schedule instead of undoing it.",
+    );
+  }
   if (original.status === "queued" || original.status === "snapshotting" || original.status === "running") {
     throw new JobRequestError("This job is still running — wait for it to finish before undoing it.");
   }
@@ -304,6 +387,55 @@ export async function createUndoJob(
       // job's snapshots, never by re-running this filter.
       filterJson: original.filterJson ?? Prisma.JsonNull,
       actionsJson: original.actionsJson ?? Prisma.JsonNull,
+    },
+  });
+}
+
+/**
+ * Call off a scheduled job before it fires.
+ *
+ * Kept as a row rather than deleted — a merchant who set up a sale and then
+ * changed their mind is owed a record of that, and the job wrote nothing there
+ * is anything to undo. Only a job that has not started can be cancelled; once
+ * it is queued it belongs to the engine.
+ */
+export async function cancelScheduledJob(
+  shopId: string,
+  jobId: string,
+): Promise<EditJob> {
+  const cancelled = await db.editJob.updateMany({
+    where: { id: jobId, shopId, status: "scheduled" },
+    data: { status: "cancelled", scheduledFor: null, revertAt: null, completedAt: new Date() },
+  });
+  if (cancelled.count === 0) {
+    throw new JobRequestError(
+      "That edit is no longer scheduled — it has already started or been cancelled.",
+    );
+  }
+  const job = await db.editJob.findUnique({ where: { id: jobId } });
+  if (!job) throw new JobRequestError("That job no longer exists.");
+  return job;
+}
+
+/**
+ * A scheduled job that reached its time with no credits left.
+ *
+ * Marked failed with the plan's own message so it says so in the history rather
+ * than disappearing — SPEC §7: the merchant finds out, and finds out where they
+ * would look.
+ */
+export async function cancelJobOverQuota(
+  jobId: string,
+  message: string,
+): Promise<void> {
+  await db.editJob.updateMany({
+    where: { id: jobId, status: "queued" },
+    data: {
+      status: "failed",
+      error: message,
+      completedAt: new Date(),
+      scheduledFor: null,
+      revertAt: null,
     },
   });
 }
@@ -373,10 +505,14 @@ export async function runJob(
  * borrowing the request's — which would tie a multi-minute job's lifetime to a
  * page load.
  */
-export function runJobDetached(shop: string, jobId: string): void {
+export function runJobDetached(
+  shop: string,
+  jobId: string,
+  resolve: AdminResolver = adminFor,
+): void {
   void (async () => {
     try {
-      await runJob(await adminFor(shop), jobId);
+      await runJob(await resolve(shop), jobId);
     } catch (error) {
       await failJob(jobId, errorMessage(error)).catch(() => {});
     }
@@ -730,6 +866,55 @@ async function assignBulkLines(units: MutationUnit[]): Promise<void> {
  * going.
  */
 export async function reconcileBulkJob(
+  admin: AdminApiContext,
+  job: EditJob,
+): Promise<void> {
+  if (!job.bulkOpGid || !job.stage) return;
+
+  // The claim SPEC §5 recorded as missing. This is reachable from the
+  // `bulk_operations/finish` webhook, from the stale sweep, and now from the
+  // scheduler's tick — three entrants with nothing between them. `settleBulkResults`
+  // survives concurrency on its own (it only touches rows that are still
+  // pending), but the `advanceBulk` after it does not: two entrants would each
+  // see the same next stage with work outstanding, each start a bulk operation
+  // for it, and the job's `bulkOpGid` would end up pointing at whichever wrote
+  // last — orphaning the other operation's results and stranding its rows.
+  if (!(await claimReconcile(job.id))) return;
+  try {
+    await reconcileClaimed(admin, job);
+  } finally {
+    await releaseReconcile(job.id);
+  }
+}
+
+/**
+ * How long a reconcile may hold its claim before another entrant may take it.
+ *
+ * Long enough to download a results file and fall back to inline mutations for
+ * a large stage; short enough that a process killed mid-reconcile does not
+ * leave the job unreconcilable until someone notices.
+ */
+const RECONCILE_LOCK_MS = 5 * 60 * 1000;
+
+async function claimReconcile(jobId: string): Promise<boolean> {
+  const expiry = new Date(Date.now() - RECONCILE_LOCK_MS);
+  const claimed = await db.editJob.updateMany({
+    where: {
+      id: jobId,
+      OR: [{ reconcileLockAt: null }, { reconcileLockAt: { lt: expiry } }],
+    },
+    data: { reconcileLockAt: new Date() },
+  });
+  return claimed.count > 0;
+}
+
+async function releaseReconcile(jobId: string): Promise<void> {
+  await db.editJob
+    .updateMany({ where: { id: jobId }, data: { reconcileLockAt: null } })
+    .catch(() => {});
+}
+
+async function reconcileClaimed(
   admin: AdminApiContext,
   job: EditJob,
 ): Promise<void> {

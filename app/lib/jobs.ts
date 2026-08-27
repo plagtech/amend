@@ -14,22 +14,31 @@ import { WEIGHT_UNIT_LABEL } from "./actions";
  * A job's lifecycle.
  *
  *   draft         created but not submitted (unused in v1 — the wizard submits
- *                 straight to `queued`; reserved for saved/scheduled jobs)
+ *                 straight to `queued`; reserved for saved jobs)
+ *   scheduled     accepted, waiting for its `scheduledFor` time. Deliberately
+ *                 its own status rather than a `queued` job with a date: the
+ *                 drain and the stale sweep both hunt for `queued`, and a job
+ *                 due next Tuesday must be invisible to them until it is due
  *   queued        accepted, waiting for the shop's run slot
  *   snapshotting  resolving the selection and persisting before-values
  *   running       snapshots are complete and durable; mutations are in flight
  *   completed     every row was attempted (check `failedItems` for partials)
  *   failed        the job could not run, or every row failed
  *   undone        an undo job has since restored this job's before-values
+ *   cancelled     a scheduled job the merchant called off before it fired. Kept
+ *                 rather than deleted: "what happened to that sale I set up?"
+ *                 deserves an answer, and it never wrote anything to answer for
  */
 export const JOB_STATUSES = [
   "draft",
+  "scheduled",
   "queued",
   "snapshotting",
   "running",
   "completed",
   "failed",
   "undone",
+  "cancelled",
 ] as const;
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
@@ -47,13 +56,25 @@ export function isActive(status: string): boolean {
 }
 
 export function isTerminal(status: string): boolean {
-  return status === "completed" || status === "failed" || status === "undone";
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "undone" ||
+    status === "cancelled"
+  );
+}
+
+/** A job that has not run yet and can still be called off. */
+export function isPending(status: string): boolean {
+  return status === "scheduled";
 }
 
 export function jobStatusLabel(status: string, failedItems = 0): string {
   switch (status) {
     case "draft":
       return "Draft";
+    case "scheduled":
+      return "Scheduled";
     case "queued":
       return "Queued";
     case "snapshotting":
@@ -66,6 +87,8 @@ export function jobStatusLabel(status: string, failedItems = 0): string {
       return "Failed";
     case "undone":
       return "Undone";
+    case "cancelled":
+      return "Cancelled";
     default:
       return status;
   }
@@ -86,6 +109,8 @@ export function jobStatusTone(
       return "info";
     case "queued":
       return "attention";
+    case "scheduled":
+      return "info";
     default:
       return undefined;
   }

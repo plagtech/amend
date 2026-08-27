@@ -27,8 +27,8 @@ An embedded Shopify admin app that lets merchants filter products/variants, prev
 - **Framework:** Shopify Remix app template (`npm init @shopify/app@latest` — select Remix, JavaScript or TS, TS preferred). Same pattern as Spraay Batch Payouts, so reuse learnings.
 - **UI:** Shopify **Polaris** web components + App Bridge. Do NOT build custom design system — Polaris is what makes embedded apps feel native and passes "Built for Shopify" design review. "Well done yet simple" = disciplined Polaris usage (IndexTable, Filters, Page, Card, Banner, ProgressBar, Modal).
 - **DB:** Postgres on Railway (Prisma ORM — ships with the template using SQLite; swap datasource to Postgres).
-- **Queue/scheduler:** BullMQ + Redis on Railway (for scheduled edits + polling bulk op status). Keep it simple — one worker process.
-- **Hosting:** Railway (app + worker + Postgres + Redis).
+- **Queue/scheduler:** ~~BullMQ + Redis on Railway~~ — **not built, and not needed.** Phase 6 ships an in-process interval in the web server instead (`app/lib/scheduler.server.ts`); see §5. A worker service plus Redis would have doubled the deploy to run a handful of timers a day, and every state transition is a database compare-and-set anyway, which is what a queue would have been providing.
+- **Hosting:** Railway — **one web service plus Postgres.** No worker, no Redis. Deploy configuration and the dev/prod split are in `DEPLOY.md`.
 - **Shopify APIs:** Admin GraphQL API (2025-07 or latest stable). Key surfaces:
   - `bulkOperationRunQuery` — export current product state for previews/snapshots at scale
   - `bulkOperationRunMutation` + staged upload (JSONL) — apply edits at scale
@@ -138,9 +138,9 @@ Snapshot retention: cron deletes snapshots > 90 days old (free) / > 365 days (pr
 - Only one running job per shop at a time (queue others) — prevents conflicting edits and confusing undo semantics. Surface this in UI: "Queued behind: Price update (running)."
 - If a product was modified externally between snapshot and undo, undo still applies the snapshot but flags the row: "value had changed since edit."
 
-**Progress model — request-time only (accepted for now).** There is no cron, worker, or scheduler. A job moves only when something calls into the engine: a loader on the dashboard or a job page (both run `resumeStalledJobs`), the `bulk_operations/finish` webhook, or `drainQueue` running in-process behind a job that just finished. The sweep covers both shapes of stall — a job that was `snapshotting`/`running` and went quiet, and one orphaned in `queued` by a process that died before claiming the slot — but neither is noticed until somebody loads a page or a webhook lands. In practice this means a bulk job whose webhook never arrives waits for the merchant to come back and look at it. That is a deliberate trade for v1: it keeps the deploy a single web service. **A scheduled sweep is a Phase 6 item, alongside the Railway deploy work.**
+**Progress model — a timer in the web process (Phase 6).** Jobs used to move only when something called into the engine: a loader running `resumeStalledJobs`, the `bulk_operations/finish` webhook, or `drainQueue` behind a job that just finished. That was an accepted trade while every job started with a click, and it stopped being one the moment an edit could be scheduled for 6am on Friday. `app/lib/scheduler.server.ts` now runs an interval in the web server — started from `entry.server.tsx`, the one module a Remix app evaluates at boot — which every tick promotes scheduled jobs that are due, fires auto-reverts whose `revertAt` has passed, and runs the stale sweep for every shop with work in flight. **Why an in-process timer and not BullMQ + Redis + a worker (as §2 sketched), or an external cron:** the worker doubles the deploy — a second service, a Redis instance, a second copy of the engine's configuration — to run a handful of timers a day, and an external cron needs a public, non-session-authenticated endpoint on the one surface that can start writes to a merchant's catalog. The timer needs neither. Its costs are real and bounded: it only runs while a web instance is up, and it assumes roughly one instance. Every transition it makes is a compare-and-set (`UPDATE … WHERE status = 'scheduled'`, `UPDATE … WHERE revertAt IS NOT NULL`), so a second instance cannot double-fire anything — set `SCHEDULER_DISABLED=1` on any extra instance regardless. Verified by `npm run verify:schedule`, which starts the same scheduler, creates a job, and then does nothing but watch the catalog change.
 
-**Known issue — `reconcileBulkJob` can be entered twice.** It is reachable from the `bulk_operations/finish` webhook and from the stale sweep with no claim between them, so a webhook arriving while a sweep-triggered reconcile is already in flight can run both concurrently. `settleBulkResults` is safe under this — it only touches rows that are still `applied: false, error: null` — but the `advanceBulk` call that follows is not: both entries can decide the same next stage still has pending rows and each call `startBulkStage`, producing a duplicate `bulkOperationRunMutation` for that stage and a `bulkOpGid` on the job that points at whichever wrote last, orphaning the other operation's results. Rows already applied are not re-sent and the mutations are absolute rather than relative, so the catalog outcome is not corrupted; the cost is a wasted bulk operation and a job that can strand rows waiting on a webhook for a GID it is no longer tracking. Fix is a claim around the reconcile, the same shape as `claimRunSlot`. Not addressed yet.
+**Fixed in Phase 6 — `reconcileBulkJob` could be entered twice.** It is reachable from the `bulk_operations/finish` webhook, from the stale sweep, and now from the scheduler's tick. With no claim between them, two entrants could each decide the same stage still had pending rows and each call `startBulkStage`, producing a duplicate `bulkOperationRunMutation` and a `bulkOpGid` pointing at whichever wrote last — orphaning the other operation's results and stranding its rows. (`settleBulkResults` was always safe: it only touches rows still `applied: false, error: null`.) The reconcile now takes a claim first — `EditJob.reconcileLockAt`, compare-and-set, expiring after five minutes so a killed process cannot wedge a job — and releases it in a `finally`. Third entry point, real claim.
 
 ---
 
@@ -152,7 +152,7 @@ Snapshot retention: cron deletes snapshots > 90 days old (free) / > 365 days (pr
 | `/app/edit/new` | The wizard: Filter panel → results IndexTable → Actions builder → Preview → Apply. Single page, progressive disclosure (Polaris `Layout` with steps), NOT a multi-route wizard. |
 | `/app/jobs/:id` | Job detail: progress, per-row results, errors, undo, "re-run", "save as template" |
 | `/app/templates` | Saved templates list; "run" pre-fills the wizard |
-| `/app/settings` | Plan/billing, snapshot retention info |
+| `/app/settings` | Plan/billing (upgrade, cancel, live subscription state), usage meter, snapshot retention. Also re-syncs `Shop.plan` from Shopify on load — the webhook keeps it current, this is where a missed delivery is caught |
 
 **Design rules ("well done yet simple"):**
 - Polaris defaults everywhere; zero custom CSS beyond spacing tweaks.
@@ -174,6 +174,17 @@ Snapshot retention: cron deletes snapshots > 90 days old (free) / > 365 days (pr
 
 Pricing principle: do not go below $19 — in this category cheap signals fragile, and merchants are trusting the app with their entire catalog.
 - Job counter resets on `cycleStart` + 30 days. Enforce server-side, show meter client-side. When free limit hit: Polaris banner with upgrade CTA — never block viewing history or **undo** (undo must ALWAYS work regardless of plan; this is a trust feature and a review-bait differentiator).
+
+### Downgrade and cancellation (Phase 6 — this is the contract)
+
+A downgrade lowers what a merchant can *start*. It never takes anything away.
+
+- **Plan reverts to the free caps** the moment Shopify reports the subscription is no longer paid — `ACTIVE` and `ACCEPTED` are paid; `CANCELLED`, `DECLINED`, `EXPIRED`, `FROZEN` and `PENDING` are not. A frozen subscription is one Shopify has suspended for non-payment, and continuing to hand out paid features on it is not a decision we ever made.
+- **Templates past the free allowance become read-only. They are never deleted.** They still list, still show their filter and actions, and become runnable again the instant the shop upgrades or deletes enough to come back under the cap. The allowance is the **oldest three**, so which ones are live does not shuffle when a fourth is added or a fifth deleted. Enforced in `openTemplate`, which is why the Use button is a POST and not a link — a link is not a gate.
+- **Editing a template is delete-and-re-save**, so a read-only template is also not editable: there is no separate edit path to gate.
+- **In-flight jobs finish.** The quota is consulted when a job is created and when a scheduled one fires — never while one is running. A merchant who cancels mid-edit gets the edit they already started.
+- **Undo is never gated, on any plan, at any usage.** It consumes no credit and is refused by nothing. `verify:plan` asserts this at the limit, on the free plan, as its own check.
+- **Regex** is refused server-side on both the preview and the apply paths, so a browser posting `regex: true` by hand is turned away with the same message the UI shows.
 
 ---
 
@@ -215,7 +226,29 @@ Pricing principle: do not go below $19 — in this category cheap signals fragil
 >
 > **Read cost.** Description, SEO and the variant `inventoryItem` are fetched only when an action touches them (`actionsNeedContent` / `actionsNeedInventory`), and the preview scan drops from 25 products per request to 10 when inventory comes along — `inventoryItem` is a nested object, so asking for it on 25×25 nodes lands past Shopify's 1,000-point ceiling and every page of the scan would be rejected. Shopify also rejects an omitted `Boolean!` variable even where the document declares a default for it, so both flags are sent on every request.
 
-**Phase 6 — Billing + polish (days 12-13):** Billing API, plan gating, scheduling + auto-revert (BullMQ delayed jobs), empty states, error states, seed-store QA at 1,000 products. Also: the scheduled sweep that §5 defers — a periodic `resumeStalledJobs` across shops, so a job no longer waits on someone opening the app — and a claim around `reconcileBulkJob`.
+**Phase 6 — Billing + scheduling + deploy (days 12-13):** Billing API, plan gating, scheduling + auto-revert, the scheduled sweep §5 deferred, a claim around `reconcileBulkJob`, Railway deploy configuration.
+
+> **Billing API, not Managed Pricing.** Both fit one $19 plan, and Managed Pricing is what Shopify pushes for App Store apps — it hosts the plan picker and puts the price on the listing. We use the Billing API (`appSubscriptionCreate` via `shopify-app-remix`'s helpers) for three reasons. **It is verifiable from the repo:** Managed Pricing plans are created in the Partner Dashboard and cannot be defined, read back or asserted from code, whereas `npm run verify:billing` drives a real test subscription against the dev store. **The plan lives next to the gates it drives:** `PRO_PLAN` in `app/lib/billing.server.ts` is the same constant the quota, template and regex checks read. **The surface needed is tiny:** one plan, one interval, no usage charges — `request`, `check`, `cancel`. Managed Pricing's value is in the cases we do not have. Moving to it later is a listing-side change: the read path is `currentAppInstallation.activeSubscriptions` either way, which is exactly what `syncPlan` reads.
+>
+> **Two facts that decided the shape of the verification.** Shopify refuses `appSubscriptionCreate` from a custom app's Admin API token — *"this application is currently owned by a Shop. It must be migrated to the Shopify partners area"* — so the seed token every other script uses cannot exercise billing; `verify:billing` runs as the app, with the offline token stored at install. And no API accepts a charge on a merchant's behalf, nor should one: the script prints the confirmation URL and waits for a human. Everything either side of that click is automated.
+>
+> **`Shop.plan` is the gate's truth**, kept honest by the `app_subscriptions/update` webhook, a sync when the merchant returns from approval, and a sync whenever Settings is opened. Gates are enforced in the functions the routes call — `createApplyJob` (quota, regex), `saveTemplate` (cap), `openTemplate` (read-only lock) — never by hiding a button. `verify:plan` asserts each one by calling those functions directly.
+>
+> **Scheduling.** `scheduledFor` and `revertAt` are wired to the confirm step. A scheduled job pre-resolves nothing: it stores the same filter and actions as any other job and goes through the identical snapshot-then-mutate pipeline at fire time, against the catalog as it is *then*. It gets its own `scheduled` status, because the drain and the stale sweep both hunt for `queued` and a job due next Tuesday must be invisible to them. A merchant can cancel one until it starts; a cancelled job is kept, not deleted.
+>
+> **The quota is spent at fire time, not scheduling time** — a plan can change in between, and an edit that never runs should cost nothing. A scheduled job that fires over the allowance is marked failed with the plan's own message on it, in the history where the merchant will look, rather than disappearing.
+
+**Verification (as of Phase 6).** Six commands, all green:
+
+| Command | What it proves | Needs |
+|---|---|---|
+| `npm run verify:filters` | filter compilation against a known catalog, and every diff transform, hand-computed | dev store (read-only) |
+| `npm run verify:apply` | one edit through the real engine, inline path: store state before, after apply, after undo | dev store (writes, reverses itself) |
+| `npm run verify:apply -- --bulk` | the same, through Bulk Operations, ~100 products | dev store |
+| `npm run verify:plan` | every plan gate, called as the routes call it — quota, regex, template cap, read-only lock, undo-always-free | Postgres only |
+| `npm run verify:schedule` | a scheduled job firing from the timer with no page open, auto-revert, cancellation, and a job that fires over quota failing loudly | dev store |
+| `npm run verify:deploy` | the Railway image builds, migrates an empty database, answers `/healthz`, starts the scheduler, and every webhook route rejects an unsigned and a forged request | Docker |
+| `npm run verify:billing` | the subscription lifecycle on the dev store with a test charge, and the gates opening and closing with it | an installed app session + **one human click** to approve the charge |
 
 **Phase 7 — Submission (day 14):** listing assets, privacy policy, review checklist pass, submit.
 

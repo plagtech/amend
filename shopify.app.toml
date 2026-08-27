@@ -32,6 +32,13 @@ api_version = "2026-07"
   uri = "/webhooks/app/scopes_update"
   topics = ["app/scopes_update"]
 
+  # Keeps Shop.plan honest without waiting for a page load — a card declining
+  # or a trial ending is exactly the case nobody opens the app to cause.
+  # Handled by: /app/routes/webhooks.app.subscriptions_update.tsx
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/subscriptions_update"
+  topics = ["app_subscriptions/update"]
+
   # Mandatory GDPR compliance webhooks (public apps).
   # See: https://shopify.dev/docs/apps/build/privacy-law-compliance
   # Handled by: /app/routes/webhooks.customers.data_request.tsx

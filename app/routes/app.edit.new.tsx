@@ -72,7 +72,8 @@ import {
   serializeActions,
 } from "../lib/actions";
 import type { PreviewResult } from "../lib/preview.server";
-import { buildPreview } from "../lib/preview.server";
+import { EMPTY_PREVIEW, buildPreview } from "../lib/preview.server";
+import { assertActionsAllowed, planFor } from "../lib/billing.server";
 import type { JobScope } from "../lib/snapshots.server";
 import { TemplateError, saveTemplate } from "../lib/templates.server";
 import type { ProductStatus, SelectFilters, SelectView } from "../lib/filters";
@@ -102,6 +103,26 @@ import { fetchFacets, fetchProductPage } from "../lib/products.server";
 import { SaveTemplateModal } from "../components/save-template-modal";
 
 const DEFAULT_SORT = "TITLE asc";
+
+/**
+ * A `datetime-local` value as an instant.
+ *
+ * `new Date("2026-08-28T06:00")` reads the string in the browser's timezone,
+ * which is the merchant's — "6am" means 6am where they are, and the server
+ * stores the instant that resolves to.
+ */
+function toInstant(local: string): string | undefined {
+  if (!local) return undefined;
+  const date = new Date(local);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+/** An ISO instant off the wire, or null. Anything unparseable is "not set". */
+function parseInstant(value: string | undefined): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
@@ -154,7 +175,15 @@ export interface SaveTemplateResponse {
  * same edit therefore still works — it goes through a second preview. What
  * cannot happen is the *same* approved diff being applied twice.
  */
-export type PreviewResponse = PreviewResult & { idempotencyKey: string };
+export type PreviewResponse = PreviewResult & {
+  idempotencyKey: string;
+  /**
+   * A plan refusal. The preview is where a merchant finds out that regex is a
+   * Pro feature — refusing only at Apply would mean building the whole edit
+   * first and being turned away at the last step.
+   */
+  error?: string | null;
+};
 
 /**
  * Preview and Apply. Both POSTed rather than folded into the loader because the
@@ -185,6 +214,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     scopeLabel?: string;
     idempotencyKey?: string;
     name?: string;
+    scheduledFor?: string;
+    revertAt?: string;
   };
 
   const filters = parseFilters(new URLSearchParams(body.filters ?? ""));
@@ -231,6 +262,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       reverse,
     };
     try {
+      // The browser sends instants, converted from what the merchant picked in
+      // their own timezone — the server never guesses what "6am" meant.
+      const scheduledFor = parseInstant(body.scheduledFor);
+      const revertAt = parseInstant(body.revertAt);
+      if (revertAt && revertAt <= new Date()) {
+        return {
+          jobId: null,
+          error: "The automatic undo has to be in the future.",
+        } satisfies ApplyResponse;
+      }
+      if (revertAt && scheduledFor && revertAt <= scheduledFor) {
+        return {
+          jobId: null,
+          error: "The automatic undo has to come after the edit runs.",
+        } satisfies ApplyResponse;
+      }
+
       const job = await createApplyJob({
         shopId: session.shop,
         name: jobName(actions, String(body.scopeLabel ?? "").slice(0, 60)),
@@ -238,8 +286,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         actions,
         idempotencyKey:
           typeof body.idempotencyKey === "string" ? body.idempotencyKey : "",
+        scheduledFor,
+        revertAt,
       });
-      runJobDetached(session.shop, job.id);
+      // A scheduled job is not started here — the scheduler picks it up when it
+      // is due. Kicking it off now would run it immediately, which is precisely
+      // what the merchant asked us not to do.
+      if (job.status !== "scheduled") runJobDetached(session.shop, job.id);
       return { jobId: job.id, error: null } satisfies ApplyResponse;
     } catch (error) {
       if (error instanceof PlanLimitError || error instanceof JobRequestError) {
@@ -247,6 +300,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
       throw error;
     }
+  }
+
+  // Same gate as the apply path, run early so the answer arrives with the diff
+  // rather than after it. Both are server-side; the checkbox in the builder is
+  // a convenience, not a control.
+  try {
+    assertActionsAllowed(await planFor(session.shop), actions);
+  } catch (error) {
+    if (error instanceof PlanLimitError) {
+      return {
+        ...EMPTY_PREVIEW,
+        idempotencyKey: "",
+        error: error.message,
+      } satisfies PreviewResponse;
+    }
+    throw error;
   }
 
   const preview = await buildPreview(admin, {
@@ -324,10 +393,14 @@ export default function NewBulkEdit() {
   const [excluded, setExcluded] = useState<string[]>([]);
 
   const previewing = previewFetcher.state !== "idle";
-  const preview =
+  const previewResponse =
     previewedKey === previewKey && previewFetcher.data
       ? previewFetcher.data
       : null;
+  // A refused preview is not a preview. Keeping it null is what leaves Apply
+  // disabled — the plan message replaces the diff rather than sitting above one.
+  const previewError = previewResponse?.error ?? null;
+  const preview = previewError ? null : previewResponse;
 
   const runPreview = useCallback(() => {
     setPreviewedKey(previewKey);
@@ -366,6 +439,16 @@ export default function NewBulkEdit() {
   const canApply = preview !== null && summary.rows > 0;
   const applying = applyFetcher.state !== "idle";
 
+  /**
+   * When to run it. Empty strings mean "now" and "never revert".
+   *
+   * Held as the browser's own `datetime-local` strings and converted to
+   * instants only at submit, so what the merchant picked is interpreted in the
+   * timezone they picked it in.
+   */
+  const [scheduleAt, setScheduleAt] = useState("");
+  const [revertAtLocal, setRevertAtLocal] = useState("");
+
   const runApply = useCallback(() => {
     // `canApply` already gates the button on a live preview; this is the same
     // condition restated where the key is actually read, so a future caller
@@ -384,6 +467,8 @@ export default function NewBulkEdit() {
         // Spent by the first POST to arrive. A replay of this exact body lands
         // back on the job that POST created rather than starting a second one.
         idempotencyKey: preview.idempotencyKey,
+        scheduledFor: toInstant(scheduleAt) ?? "",
+        revertAt: toInstant(revertAtLocal) ?? "",
       },
       { method: "POST", encType: "application/json" },
     );
@@ -396,6 +481,8 @@ export default function NewBulkEdit() {
     sort,
     excluded,
     facets.collections,
+    scheduleAt,
+    revertAtLocal,
   ]);
 
   // Once a job exists it, not this page, is where progress, failures and Undo
@@ -726,6 +813,16 @@ export default function NewBulkEdit() {
               onRemove={removeAction}
             />
 
+            {previewError ? (
+              <Banner
+                tone="warning"
+                title="This edit needs Pro"
+                action={{ content: "See plans", url: "/app/settings" }}
+              >
+                <p>{previewError}</p>
+              </Banner>
+            ) : null}
+
             <PreviewSection
               preview={preview}
               previewing={previewing}
@@ -762,6 +859,10 @@ export default function NewBulkEdit() {
         actions={completeActions}
         summary={summary}
         scopeLabel={describeScope(filters, facets.collections)}
+        scheduleAt={scheduleAt}
+        onScheduleAtChange={setScheduleAt}
+        revertAt={revertAtLocal}
+        onRevertAtChange={setRevertAtLocal}
       />
     </Page>
   );
@@ -785,6 +886,10 @@ function ApplyConfirmModal({
   actions,
   summary,
   scopeLabel,
+  scheduleAt,
+  onScheduleAtChange,
+  revertAt,
+  onRevertAtChange,
 }: {
   open: boolean;
   onClose: () => void;
@@ -793,16 +898,24 @@ function ApplyConfirmModal({
   actions: EditAction[];
   summary: IncludedSummary;
   scopeLabel: string;
+  scheduleAt: string;
+  onScheduleAtChange: (value: string) => void;
+  revertAt: string;
+  onRevertAtChange: (value: string) => void;
 }) {
+  const scheduled = scheduleAt !== "";
+
   return (
     <Modal
       open={open}
       onClose={onClose}
-      title="Apply this edit?"
+      title={scheduled ? "Schedule this edit?" : "Apply this edit?"}
       primaryAction={{
-        content: `Apply ${summary.rows.toLocaleString()} change${
-          summary.rows === 1 ? "" : "s"
-        }`,
+        content: scheduled
+          ? "Schedule this edit"
+          : `Apply ${summary.rows.toLocaleString()} change${
+              summary.rows === 1 ? "" : "s"
+            }`,
         onAction: onConfirm,
         loading: applying,
       }}
@@ -839,6 +952,38 @@ function ApplyConfirmModal({
                 <List.Item key={index}>{describeActions([action])}</List.Item>
               ))}
             </List>
+          </BlockStack>
+
+          <BlockStack gap="200">
+            <Text as="h3" variant="headingSm">
+              When
+            </Text>
+            <InlineStack gap="300" blockAlign="end" wrap>
+              <TextField
+                label="Run this edit"
+                type="datetime-local"
+                value={scheduleAt}
+                onChange={onScheduleAtChange}
+                helpText="Leave empty to run it now"
+                autoComplete="off"
+              />
+              <TextField
+                label="Undo it automatically"
+                type="datetime-local"
+                value={revertAt}
+                onChange={onRevertAtChange}
+                helpText="Optional — for a sale that ends by itself"
+                autoComplete="off"
+              />
+            </InlineStack>
+            {scheduled ? (
+              <Text as="p" variant="bodySm" tone="subdued">
+                Nothing is resolved now. When it runs, it finds whatever matches
+                this filter at that moment, snapshots it, and applies — so the
+                counts above are today&apos;s estimate, not a promise. You can
+                cancel it from the job page until it starts.
+              </Text>
+            ) : null}
           </BlockStack>
 
           <Text as="p" variant="bodySm" tone="subdued">

@@ -7,8 +7,16 @@ import {
 } from "@remix-run/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { startScheduler } from "./lib/scheduler.server";
 
 export const streamTimeout = 5000;
+
+// The background trigger (SPEC §5). Started here because this module is
+// evaluated once when the server build loads, which is the only place in a
+// Remix app that runs at boot rather than per request — and a scheduled job has
+// to fire whether or not anyone has opened a page. `startScheduler` is
+// idempotent and honours SCHEDULER_DISABLED=1.
+startScheduler();
 
 export default async function handleRequest(
   request: Request,

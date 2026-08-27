@@ -49,7 +49,10 @@ model EditJob {
   name         String                          // auto: "Price -10% on Summer collection"
   filterJson   Json                            // the SELECT criteria
   actionsJson  Json                            // ordered list of edit actions
-  status       String     @default("draft")    // draft|queued|snapshotting|running|completed|failed|undone
+  status       String     @default("draft")    // draft|scheduled|queued|snapshotting|running|completed|failed|undone|cancelled
+  // Set when the merchant schedules the edit for later. The job holds no
+  // resolved selection: it snapshots and resolves scope at fire time through
+  // the same pipeline as any other job.
   scheduledFor DateTime?
   revertAt     DateTime?                        // optional auto-revert (sale windows)
   totalItems   Int        @default(0)
@@ -85,10 +88,20 @@ model EditJob {
   heartbeatAt  DateTime?
   error        String?                          // job-level failure message
 
+  // --- Phase 6 -------------------------------------------------------------
+  // Held while a bulk reconcile is in flight. reconcileBulkJob is reachable
+  // from the bulk_operations/finish webhook, the stale sweep and the scheduler
+  // tick; without a claim two of them can each start a bulk operation for the
+  // same stage. Expires on its own so a killed process cannot wedge a job.
+  reconcileLockAt DateTime?
+
   @@index([shopId])
   @@index([shopId, status])
   // The orphaned-queue sweep: queued jobs for one shop, oldest first.
   @@index([shopId, status, updatedAt])
+  // The scheduler tick, which asks "anything due?" across every shop.
+  @@index([status, scheduledFor])
+  @@index([revertAt])
 }
 
 model Snapshot {
