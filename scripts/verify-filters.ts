@@ -23,8 +23,18 @@ import process from "node:process";
 
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 
-import type { EditAction } from "../app/lib/actions";
-import { nextPrice, nextTags } from "../app/lib/actions";
+import type {
+  DiffProduct,
+  EditAction,
+  TextAction,
+} from "../app/lib/actions";
+import {
+  emptyMatch,
+  nextPrice,
+  nextTags,
+  productDiffs,
+  variantDiffs,
+} from "../app/lib/actions";
 import { emptyFilters } from "../app/lib/filters";
 import type { SelectFilters } from "../app/lib/filters";
 import { buildPreview } from "../app/lib/preview.server";
@@ -321,7 +331,7 @@ const SALE_EDIT: EditAction[] = [
     amount: "15",
     rounding: "end99",
   },
-  { type: "tags", op: "add", tags: ["sale"] },
+  { type: "tags", op: "add", tags: ["sale"], match: emptyMatch() },
 ];
 
 async function verifyPreview(
@@ -371,13 +381,227 @@ async function verifyPreview(
   );
   check(
     "add tag is case-insensitively idempotent",
-    nextTags(["Sale", "eco"], { type: "tags", op: "add", tags: ["sale"] }),
+    nextTags(["Sale", "eco"], {
+      type: "tags",
+      op: "add",
+      tags: ["sale"],
+      match: emptyMatch(),
+    }),
     ["Sale", "eco"],
   );
   check(
     "remove tag ignores case",
-    nextTags(["Sale", "eco"], { type: "tags", op: "remove", tags: ["SALE"] }),
+    nextTags(["Sale", "eco"], {
+      type: "tags",
+      op: "remove",
+      tags: ["SALE"],
+      match: emptyMatch(),
+    }),
     ["eco"],
+  );
+
+  // --- Phase 5 fields, same treatment: hand-computed, no network -----------
+  console.log("\nText, SEO and inventory arithmetic:");
+
+  const product: DiffProduct = {
+    id: "gid://shopify/Product/1",
+    title: "Slate Merino Hoodie 0042",
+    handle: "amend-seed-0042",
+    status: "ACTIVE",
+    tags: ["summer", "eco-friendly"],
+    vendor: "Atlas Goods",
+    productType: "Hoodie",
+    descriptionHtml: "<p>A merino hoodie in slate. Warm hoodie.</p>",
+    seoTitle: null,
+    seoDescription: null,
+    variants: [
+      {
+        id: "gid://shopify/ProductVariant/1",
+        title: "S",
+        sku: "AMD-HOO-0042-S",
+        price: "40.00",
+        compareAtPrice: null,
+        inventoryPolicy: "DENY",
+        tracked: true,
+      },
+    ],
+  };
+
+  const text = (over: Partial<TextAction>): TextAction => ({
+    type: "text",
+    field: "title",
+    op: "replace",
+    match: emptyMatch(),
+    value: "",
+    ...over,
+  });
+
+  const paths = (diffs: { fieldPath: string; after: string }[]) =>
+    diffs.map((diff) => [diff.fieldPath, diff.after]);
+
+  check(
+    "title find & replace, case-insensitive by default",
+    paths(
+      productDiffs(product, [
+        text({ match: { ...emptyMatch(), find: "hoodie", replaceWith: "Hooded Top" } }),
+      ]),
+    ),
+    [["product.title", "Slate Merino Hooded Top 0042"]],
+  );
+  check(
+    "match case leaves a differently-cased word alone",
+    productDiffs(product, [
+      text({
+        match: {
+          find: "hoodie",
+          replaceWith: "Hooded Top",
+          caseSensitive: true,
+          regex: false,
+        },
+      }),
+    ]),
+    [],
+  );
+  check(
+    "description replace hits every occurrence",
+    paths(
+      productDiffs(product, [
+        text({
+          field: "description",
+          match: { ...emptyMatch(), find: "hoodie", replaceWith: "pullover" },
+        }),
+      ]),
+    ),
+    [["product.descriptionHtml", "<p>A merino pullover in slate. Warm pullover.</p>"]],
+  );
+  check(
+    "a find that matches nothing is not a change",
+    productDiffs(product, [
+      text({ match: { ...emptyMatch(), find: "Parka", replaceWith: "Coat" } }),
+    ]),
+    [],
+  );
+  check(
+    "an invalid regex matches nothing rather than throwing",
+    productDiffs(product, [
+      text({
+        match: { find: "(unclosed", replaceWith: "x", caseSensitive: false, regex: true },
+      }),
+    ]),
+    [],
+  );
+  check(
+    "regex mode, with a backreference",
+    paths(
+      productDiffs(product, [
+        text({
+          match: {
+            find: "(\\w+) Hoodie",
+            replaceWith: "$1 Hoodie Classic",
+            caseSensitive: true,
+            regex: true,
+          },
+        }),
+      ]),
+    ),
+    [["product.title", "Slate Merino Hoodie Classic 0042"]],
+  );
+  check(
+    "SEO title templating reads the running title, not the original",
+    paths(
+      productDiffs(product, [
+        text({ match: { ...emptyMatch(), find: "Slate", replaceWith: "Charcoal" } }),
+        text({ field: "seoTitle", op: "set", value: "{{title}} | {{vendor}}" }),
+      ]),
+    ),
+    [
+      ["product.title", "Charcoal Merino Hoodie 0042"],
+      ["product.seo.title", "Charcoal Merino Hoodie 0042 | Atlas Goods"],
+    ],
+  );
+  check(
+    "an unknown token is left visible rather than blanked",
+    paths(
+      productDiffs(product, [
+        text({ field: "seoDescription", op: "set", value: "{{titel}} by {{vendor}}" }),
+      ]),
+    ),
+    [["product.seo.description", "{{titel}} by Atlas Goods"]],
+  );
+  check(
+    "append and prepend keep the merchant's own spacing",
+    paths(
+      productDiffs(product, [
+        text({ op: "append", value: " — Sale" }),
+        text({ op: "prepend", value: "New: " }),
+      ]),
+    ),
+    [["product.title", "New: Slate Merino Hoodie 0042 — Sale"]],
+  );
+  check(
+    "vendor set to what it already is is not a change",
+    productDiffs(product, [
+      text({ field: "vendor", op: "set", value: "Atlas Goods" }),
+    ]),
+    [],
+  );
+  check(
+    "tag find & replace rewrites each tag, dropping emptied ones",
+    nextTags(product.tags, {
+      type: "tags",
+      op: "findReplace",
+      tags: [],
+      match: { ...emptyMatch(), find: "-friendly", replaceWith: "" },
+    }),
+    ["summer", "eco"],
+  );
+  check(
+    "two tags collapsing into one are deduped",
+    nextTags(["Summer", "summer-sale"], {
+      type: "tags",
+      op: "findReplace",
+      tags: [],
+      match: { ...emptyMatch(), find: "-sale", replaceWith: "" },
+    }),
+    ["Summer"],
+  );
+  check(
+    "out-of-stock policy",
+    paths(
+      variantDiffs(product.variants[0], [
+        { type: "inventory", field: "policy", value: true },
+      ]),
+    ),
+    [["variant.inventoryPolicy", "Continue selling"]],
+  );
+  check(
+    "setting the policy it already has is not a change",
+    variantDiffs(product.variants[0], [
+      { type: "inventory", field: "policy", value: false },
+    ]),
+    [],
+  );
+  check(
+    "tracking",
+    paths(
+      variantDiffs(product.variants[0], [
+        { type: "inventory", field: "tracked", value: false },
+      ]),
+    ),
+    [["variant.inventoryItem.tracked", "No"]],
+  );
+  check(
+    "a field the scan never read is never diffed",
+    productDiffs(
+      { ...product, descriptionHtml: undefined },
+      [
+        text({
+          field: "description",
+          match: { ...emptyMatch(), find: "merino", replaceWith: "wool" },
+        }),
+      ],
+    ),
+    [],
   );
 
   // --- end to end, against the seeded store --------------------------------
@@ -478,7 +702,9 @@ async function verifyPreview(
   const noop = await buildPreview(admin, {
     filters: { ...emptyFilters(), collectionId, priceMin: "10", priceMax: "20" },
     // Every seeded product already carries "amend-seed".
-    actions: [{ type: "tags", op: "add", tags: ["amend-seed"] }],
+    actions: [
+      { type: "tags", op: "add", tags: ["amend-seed"], match: emptyMatch() },
+    ],
     selection: { mode: "all", excluded: [] },
     sortKey: "TITLE",
     reverse: false,

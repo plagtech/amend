@@ -19,6 +19,7 @@ import {
   Button,
   ButtonGroup,
   Card,
+  Checkbox,
   ChoiceList,
   EmptyState,
   IndexFilters,
@@ -53,17 +54,25 @@ import {
   selectionSignature,
   useSelection,
 } from "../lib/use-selection";
-import type { EditAction, PreviewRow } from "../lib/actions";
+import type {
+  ActionMenuKey,
+  EditAction,
+  PreviewRow,
+  TextMatch,
+} from "../lib/actions";
 import {
   ACTION_TYPES,
+  TOKEN_HELP,
   actionsSignature,
   isActionComplete,
   newAction,
   parseActions,
+  serializeActions,
 } from "../lib/actions";
 import type { PreviewResult } from "../lib/preview.server";
 import { buildPreview } from "../lib/preview.server";
 import type { JobScope } from "../lib/snapshots.server";
+import { TemplateError, saveTemplate } from "../lib/templates.server";
 import type { ProductStatus, SelectFilters, SelectView } from "../lib/filters";
 import {
   PRODUCT_STATUSES,
@@ -88,6 +97,7 @@ import {
   isSortKey,
 } from "../lib/catalog";
 import { fetchFacets, fetchProductPage } from "../lib/products.server";
+import { SaveTemplateModal } from "../components/save-template-modal";
 
 const DEFAULT_SORT = "TITLE asc";
 
@@ -113,12 +123,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     facets,
     filters,
     sort: `${sortKey} ${reverse ? "desc" : "asc"}`,
+    // Present when the wizard was opened from a saved template. Parsed here
+    // rather than in the browser so a hand-edited URL cannot put anything into
+    // the builder that `parseActions` would not accept from a stored job.
+    initialActions: parseActions(params.get("actions")),
   };
 };
 
 /** What the Apply branch of the action hands back to the browser. */
 export interface ApplyResponse {
   jobId: string | null;
+  error: string | null;
+}
+
+/** What the Save-as-template branch hands back. */
+export interface SaveTemplateResponse {
+  saved: string | null;
   error: string | null;
 }
 
@@ -162,6 +182,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     excluded?: unknown;
     scopeLabel?: string;
     idempotencyKey?: string;
+    name?: string;
   };
 
   const filters = parseFilters(new URLSearchParams(body.filters ?? ""));
@@ -170,6 +191,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const reverse = rawDirection === "desc";
   const actions = parseActions(body.actions);
   const selection = coerceSelection(body.selection);
+
+  // Saving a template writes no catalog data and needs no preview — it is the
+  // filter and the actions as they stand, which is exactly what has already
+  // been posted here.
+  if (body.intent === "saveTemplate") {
+    try {
+      const template = await saveTemplate({
+        shopId: session.shop,
+        name: String(body.name ?? ""),
+        filters,
+        actions,
+      });
+      return {
+        saved: template.name,
+        error: null,
+      } satisfies SaveTemplateResponse;
+    } catch (error) {
+      if (error instanceof TemplateError) {
+        return {
+          saved: null,
+          error: error.message,
+        } satisfies SaveTemplateResponse;
+      }
+      throw error;
+    }
+  }
 
   if (body.intent === "apply") {
     const scope: JobScope = {
@@ -213,7 +260,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function NewBulkEdit() {
-  const { page, facets, filters, sort } = useLoaderData<typeof loader>();
+  const { page, facets, filters, sort, initialActions } =
+    useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigation = useNavigation();
   const { mode, setMode } = useSetIndexFiltersMode();
@@ -224,15 +272,18 @@ export default function NewBulkEdit() {
 
   // --- edit actions ---------------------------------------------------------
 
-  const [actions, setActions] = useState<EditAction[]>([]);
+  // Seeded once, from the `actions` param a saved template links with. Not kept
+  // in sync with the URL afterwards: the builder is the source of truth from the
+  // first keystroke, and the param drops off the moment a filter changes.
+  const [actions, setActions] = useState<EditAction[]>(initialActions);
   const completeActions = useMemo(
     () => actions.filter(isActionComplete),
     [actions],
   );
 
   const addAction = useCallback(
-    (type: EditAction["type"]) =>
-      setActions((current) => [...current, newAction(type)]),
+    (key: ActionMenuKey) =>
+      setActions((current) => [...current, newAction(key)]),
     [],
   );
   const updateAction = useCallback(
@@ -351,6 +402,31 @@ export default function NewBulkEdit() {
   useEffect(() => {
     if (createdJobId) navigate(`/app/jobs/${createdJobId}`);
   }, [createdJobId, navigate]);
+
+  // --- templates ------------------------------------------------------------
+
+  const templateFetcher = useFetcher<SaveTemplateResponse>();
+  const [namingTemplate, setNamingTemplate] = useState(false);
+  const savedTemplate = templateFetcher.data?.saved ?? null;
+
+  const saveAsTemplate = useCallback(
+    (name: string) => {
+      templateFetcher.submit(
+        {
+          intent: "saveTemplate",
+          name,
+          filters: serializeFilters(filters).toString(),
+          actions: JSON.stringify(actions),
+        },
+        { method: "POST", encType: "application/json" },
+      );
+    },
+    [templateFetcher, filters, actions],
+  );
+
+  useEffect(() => {
+    if (savedTemplate) setNamingTemplate(false);
+  }, [savedTemplate]);
 
   // --- navigation helpers ---------------------------------------------------
 
@@ -479,6 +555,13 @@ export default function NewBulkEdit() {
           ? undefined
           : "Preview the changes first — nothing can be applied without a diff to approve",
       }}
+      secondaryActions={[
+        {
+          content: "Save as template",
+          disabled: completeActions.length === 0,
+          onAction: () => setNamingTemplate(true),
+        },
+      ]}
     >
       <TitleBar title="New bulk edit" />
       <Layout>
@@ -487,6 +570,19 @@ export default function NewBulkEdit() {
             {applyFetcher.data?.error ? (
               <Banner tone="critical" title="This edit was not started">
                 <p>{applyFetcher.data.error}</p>
+              </Banner>
+            ) : null}
+
+            {savedTemplate ? (
+              <Banner
+                tone="success"
+                title={`Saved “${savedTemplate}”`}
+                action={{ content: "View templates", url: "/app/templates" }}
+              >
+                <p>
+                  This filter and its actions are saved. Nothing has been applied
+                  to the catalog.
+                </p>
               </Banner>
             ) : null}
 
@@ -642,6 +738,19 @@ export default function NewBulkEdit() {
           </BlockStack>
         </Layout.Section>
       </Layout>
+
+      <SaveTemplateModal
+        open={namingTemplate}
+        defaultName={describeActions(completeActions)}
+        summary={`${describeActions(completeActions)} on ${describeScope(
+          filters,
+          facets.collections,
+        )}`}
+        saving={templateFetcher.state !== "idle"}
+        error={templateFetcher.data?.error ?? null}
+        onClose={() => setNamingTemplate(false)}
+        onSave={saveAsTemplate}
+      />
 
       <ApplyConfirmModal
         open={confirming}
@@ -1171,7 +1280,7 @@ function ActionsBuilder({
   onRemove,
 }: {
   actions: EditAction[];
-  onAdd: (type: EditAction["type"]) => void;
+  onAdd: (key: ActionMenuKey) => void;
   onUpdate: (index: number, action: EditAction) => void;
   onRemove: (index: number) => void;
 }) {
@@ -1204,10 +1313,10 @@ function ActionsBuilder({
           >
             <ActionList
               actionRole="menuitem"
-              items={ACTION_TYPES.map(({ type, label }) => ({
+              items={ACTION_TYPES.map(({ key, label }) => ({
                 content: label,
                 onAction: () => {
-                  onAdd(type);
+                  onAdd(key);
                   setMenuOpen(false);
                 },
               }))}
@@ -1264,6 +1373,10 @@ function ActionEditor({
           <PriceFields action={action} onChange={onChange} />
         ) : action.type === "tags" ? (
           <TagFields action={action} onChange={onChange} />
+        ) : action.type === "text" ? (
+          <TextFields action={action} onChange={onChange} />
+        ) : action.type === "inventory" ? (
+          <InventoryFields action={action} onChange={onChange} />
         ) : (
           <StatusFields action={action} onChange={onChange} />
         )}
@@ -1374,6 +1487,8 @@ function TagFields({
     setInput("");
   }, [action, input, onChange]);
 
+  const findReplace = action.op === "findReplace";
+
   return (
     <BlockStack gap="200">
       <InlineStack gap="300" blockAlign="end" wrap>
@@ -1383,23 +1498,38 @@ function TagFields({
             { label: "Add", value: "add" },
             { label: "Remove", value: "remove" },
             { label: "Replace all with", value: "replace" },
+            { label: "Find & replace in", value: "findReplace" },
           ]}
           value={action.op}
           onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
         />
-        <TextField
-          label="Tag"
-          value={input}
-          onChange={setInput}
-          onBlur={commit}
-          placeholder="Type a tag, press Enter"
-          autoComplete="off"
-        />
-        <Button onClick={commit} disabled={!input.trim()}>
-          Add tag
-        </Button>
+        {findReplace ? (
+          <MatchFields
+            match={action.match}
+            onChange={(match) => onChange({ ...action, match })}
+          />
+        ) : (
+          <>
+            <TextField
+              label="Tag"
+              value={input}
+              onChange={setInput}
+              onBlur={commit}
+              placeholder="Type a tag, press Enter"
+              autoComplete="off"
+            />
+            <Button onClick={commit} disabled={!input.trim()}>
+              Add tag
+            </Button>
+          </>
+        )}
       </InlineStack>
-      {action.tags.length ? (
+      {findReplace ? (
+        <Text as="p" variant="bodySm" tone="subdued">
+          Runs over each tag on its own. A tag replaced with nothing is removed,
+          and two tags that end up identical collapse into one.
+        </Text>
+      ) : action.tags.length ? (
         <InlineStack gap="200" wrap>
           {action.tags.map((tag) => (
             <Tag
@@ -1443,6 +1573,173 @@ function StatusFields({
         onChange({ ...action, value: value as ProductStatus })
       }
     />
+  );
+}
+
+/**
+ * Find & replace, shared by the text action and the tag action.
+ *
+ * Case-insensitive by default with a "match case" toggle, and regex behind its
+ * own checkbox — SPEC §3's "advanced" mode. An invalid pattern is not an error
+ * here: `actions.ts` treats it as matching nothing, so the preview just shows
+ * no changes until the pattern is finished.
+ */
+function MatchFields({
+  match,
+  onChange,
+}: {
+  match: TextMatch;
+  onChange: (match: TextMatch) => void;
+}) {
+  return (
+    <>
+      <TextField
+        label="Find"
+        value={match.find}
+        onChange={(find) => onChange({ ...match, find })}
+        autoComplete="off"
+      />
+      <TextField
+        label="Replace with"
+        value={match.replaceWith}
+        onChange={(replaceWith) => onChange({ ...match, replaceWith })}
+        placeholder="Leave empty to delete"
+        autoComplete="off"
+      />
+      <Box paddingBlockEnd="150">
+        <InlineStack gap="300" blockAlign="center">
+          <Checkbox
+            label="Match case"
+            checked={match.caseSensitive}
+            onChange={(caseSensitive) => onChange({ ...match, caseSensitive })}
+          />
+          <Checkbox
+            label="Regex"
+            checked={match.regex}
+            onChange={(regex) => onChange({ ...match, regex })}
+          />
+        </InlineStack>
+      </Box>
+    </>
+  );
+}
+
+const TEXT_FIELD_OPTIONS = [
+  { label: "Title", value: "title" },
+  { label: "Description", value: "description" },
+  { label: "SEO title", value: "seoTitle" },
+  { label: "SEO description", value: "seoDescription" },
+  { label: "Vendor", value: "vendor" },
+  { label: "Product type", value: "productType" },
+];
+
+const TEXT_OP_OPTIONS = [
+  { label: "Find & replace", value: "replace" },
+  { label: "Append", value: "append" },
+  { label: "Prepend", value: "prepend" },
+  { label: "Set to", value: "set" },
+];
+
+/**
+ * Title, description, SEO, vendor and type — one editor, because they are one
+ * action. The field picker is what the "Title & description", "SEO" and
+ * "Vendor & type" menu entries land on, each with a different field preselected.
+ */
+function TextFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "text" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  const replacing = action.op === "replace";
+
+  return (
+    <BlockStack gap="200">
+      <InlineStack gap="300" blockAlign="end" wrap>
+        <Select
+          label="Field"
+          options={TEXT_FIELD_OPTIONS}
+          value={action.field}
+          onChange={(field) =>
+            onChange({ ...action, field: field as typeof action.field })
+          }
+        />
+        <Select
+          label="Change"
+          options={TEXT_OP_OPTIONS}
+          value={action.op}
+          onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
+        />
+        {replacing ? (
+          <MatchFields
+            match={action.match}
+            onChange={(match) => onChange({ ...action, match })}
+          />
+        ) : (
+          <Box minWidth="320px">
+            <TextField
+              label={action.op === "set" ? "New value" : "Text"}
+              value={action.value}
+              onChange={(value) => onChange({ ...action, value })}
+              multiline={action.field === "description" ? 3 : undefined}
+              helpText={`Tokens: ${TOKEN_HELP}`}
+              autoComplete="off"
+            />
+          </Box>
+        )}
+      </InlineStack>
+    </BlockStack>
+  );
+}
+
+function InventoryFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "inventory" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  const policy = action.field === "policy";
+
+  return (
+    <InlineStack gap="300" blockAlign="end" wrap>
+      <Select
+        label="Setting"
+        options={[
+          { label: "When out of stock", value: "policy" },
+          { label: "Track quantity", value: "tracked" },
+        ]}
+        value={action.field}
+        onChange={(field) =>
+          onChange({ ...action, field: field as typeof action.field })
+        }
+      />
+      <Select
+        label="Set to"
+        options={
+          policy
+            ? [
+                { label: "Continue selling", value: "true" },
+                { label: "Stop selling", value: "false" },
+              ]
+            : [
+                { label: "Track quantity", value: "true" },
+                { label: "Don't track quantity", value: "false" },
+              ]
+        }
+        value={String(action.value)}
+        onChange={(value) => onChange({ ...action, value: value === "true" })}
+      />
+      {!policy && !action.value ? (
+        <Box paddingBlockEnd="150">
+          <Text as="p" variant="bodySm" tone="subdued">
+            Shopify discards the stocked quantity when a variant stops being
+            tracked. Undo restores the setting, not the numbers.
+          </Text>
+        </Box>
+      ) : null}
+    </InlineStack>
   );
 }
 

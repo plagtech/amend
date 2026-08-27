@@ -50,6 +50,8 @@ const PRODUCT_PAGE_QUERY = `#graphql
     $reverse: Boolean
     $variantLimit: Int!
     $includeVariants: Boolean!
+    $includeContent: Boolean!
+    $includeInventory: Boolean!
   ) {
     productsCount(query: $query) {
       count
@@ -79,6 +81,11 @@ const PRODUCT_PAGE_QUERY = `#graphql
         status
         tags
         totalInventory
+        descriptionHtml @include(if: $includeContent)
+        seo @include(if: $includeContent) {
+          title
+          description
+        }
         variantsCount {
           count
         }
@@ -108,6 +115,10 @@ const PRODUCT_PAGE_QUERY = `#graphql
             price
             compareAtPrice
             inventoryQuantity
+            inventoryPolicy @include(if: $includeInventory)
+            inventoryItem @include(if: $includeInventory) {
+              tracked
+            }
           }
         }
       }
@@ -275,6 +286,17 @@ export interface CollectArgs {
   sortKey: SortKey;
   reverse: boolean;
   includeVariants: boolean;
+  /**
+   * Fetch `descriptionHtml` and `seo`. Off by default: description is the
+   * largest field on a product record, and a price edit has no use for it.
+   */
+  includeContent?: boolean;
+  /**
+   * Fetch each variant's inventory settings. Off by default because
+   * `inventoryItem` is a nested object, and asking for it multiplies the query
+   * cost of every variant on the page.
+   */
+  includeInventory?: boolean;
   /** Products fetched before giving up. Defaults to `SCAN_PRODUCT_CAP`. */
   cap?: number;
   /** Products per request. Lower it when variants make each node expensive. */
@@ -306,6 +328,8 @@ export async function collectMatchingProducts(
     sortKey,
     reverse,
     includeVariants,
+    includeContent = false,
+    includeInventory = false,
     cap,
     pageSize,
     onPage,
@@ -331,6 +355,8 @@ export async function collectMatchingProducts(
       reverse,
       variantLimit: VARIANTS_PER_PRODUCT,
       includeVariants,
+      includeContent,
+      includeInventory,
     });
 
     for (const node of data.products.nodes) {
@@ -373,7 +399,12 @@ async function runPageQuery(
   admin: AdminApiContext,
   variables: Record<string, unknown>,
 ): Promise<ProductPageResponse> {
-  const response = await admin.graphql(PRODUCT_PAGE_QUERY, { variables });
+  const response = await admin.graphql(PRODUCT_PAGE_QUERY, {
+    // The optional field flags are defaulted here rather than in the document.
+    // Shopify rejects an omitted `Boolean!` variable even when the query
+    // declares a default for it, so every request has to carry them.
+    variables: { includeContent: false, includeInventory: false, ...variables },
+  });
   const body = (await response.json()) as {
     data?: ProductPageResponse;
     errors?: { message: string }[];
@@ -433,6 +464,9 @@ export interface ProductNode {
   status: ProductStatus;
   tags: string[];
   totalInventory: number | null;
+  /** Both absent unless the scan asked for them — see `CollectArgs`. */
+  descriptionHtml?: string;
+  seo?: { title: string | null; description: string | null };
   variantsCount: { count: number } | null;
   priceRangeV2: {
     minVariantPrice: { amount: string; currencyCode: string };

@@ -91,11 +91,23 @@ export function encodeValue(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-/** Human-readable rendering of a stored value, for the job page. */
-export function formatValue(raw: string): string {
+/**
+ * Human-readable rendering of a stored value, for the job page.
+ *
+ * `fieldPath` is optional and only used to name booleans and enums the way the
+ * merchant met them in the preview — "Continue selling" rather than "CONTINUE".
+ * Without it the value still renders, just more literally, which is what an
+ * unrecognised path from a future version should do.
+ */
+export function formatValue(raw: string, fieldPath?: string): string {
   const value = decodeValue(raw);
   if (value === null || value === undefined || value === "") return "—";
   if (Array.isArray(value)) return value.join(", ") || "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (fieldPath === "variant.inventoryPolicy") {
+    if (value === "CONTINUE") return "Continue selling";
+    if (value === "DENY") return "Stop selling";
+  }
   return String(value);
 }
 
@@ -167,6 +179,33 @@ interface Draft {
   snapshotIds: string[];
 }
 
+/**
+ * Write a value into a mutation input at a dotted path.
+ *
+ * A `fieldPath` is the Shopify input path with its stage prefix removed, and
+ * some of those paths are nested: `product.seo.title` addresses
+ * `ProductUpdateInput.seo.title`, and `variant.inventoryItem.tracked` addresses
+ * `ProductVariantsBulkInput.inventoryItem.tracked`. Nesting rather than
+ * flattening matters because two snapshot rows can land in the same object —
+ * an SEO title and an SEO description on one product are one `seo:` argument,
+ * and sending two of them would mean the second overwrites the first with a
+ * value the merchant never saw.
+ */
+function assignPath(
+  input: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): void {
+  const parts = path.split(".");
+  let target = input;
+  for (const part of parts.slice(0, -1)) {
+    const existing = target[part];
+    if (!existing || typeof existing !== "object") target[part] = {};
+    target = target[part] as Record<string, unknown>;
+  }
+  target[parts[parts.length - 1]] = value;
+}
+
 function buildVariantUnits(
   snapshots: SnapshotLike[],
   maxVariants: number,
@@ -191,8 +230,10 @@ function buildVariantUnits(
       );
     }
 
-    draft.input[snapshot.fieldPath.slice("variant.".length)] = decodeValue(
-      snapshot.newValue,
+    assignPath(
+      draft.input,
+      snapshot.fieldPath.slice("variant.".length),
+      decodeValue(snapshot.newValue),
     );
     draft.snapshotIds.push(snapshot.id);
   }
@@ -227,8 +268,10 @@ function buildProductUnits(snapshots: SnapshotLike[]): MutationUnit[] {
         (draft = { input: { id: snapshot.ownerGid }, snapshotIds: [] }),
       );
     }
-    draft.input[snapshot.fieldPath.slice("product.".length)] = decodeValue(
-      snapshot.newValue,
+    assignPath(
+      draft.input,
+      snapshot.fieldPath.slice("product.".length),
+      decodeValue(snapshot.newValue),
     );
     draft.snapshotIds.push(snapshot.id);
   }

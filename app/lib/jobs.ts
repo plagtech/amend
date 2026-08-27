@@ -93,6 +93,9 @@ export function jobStatusTone(
 /** Free plan allowance. Undo never counts against it — see SPEC §7. */
 export const FREE_JOB_LIMIT = 10;
 
+/** Saved edit templates on the free plan (SPEC §7). Pro is unlimited. */
+export const FREE_TEMPLATE_LIMIT = 3;
+
 /** Days in a usage cycle before the job counter resets. */
 export const CYCLE_DAYS = 30;
 
@@ -111,6 +114,16 @@ export const SYNC_ITEM_LIMIT = 100;
 export const VARIANTS_PER_MUTATION = 10;
 
 // --- naming -----------------------------------------------------------------
+
+/** Job-name wording for each text target. Lower case: these read mid-sentence. */
+const TEXT_FIELD_LABEL: Record<string, string> = {
+  title: "title",
+  description: "description",
+  seoTitle: "SEO title",
+  seoDescription: "SEO description",
+  vendor: "vendor",
+  productType: "type",
+};
 
 const MONEY_OP: Record<string, string> = {
   set: "→",
@@ -139,10 +152,36 @@ export function describeActions(actions: EditAction[]): string {
         const list = action.tags.join(", ");
         if (action.op === "add") return `add tag ${list}`;
         if (action.op === "remove") return `remove tag ${list}`;
+        if (action.op === "findReplace") {
+          return `tags "${action.match.find}" → "${action.match.replaceWith}"`;
+        }
         return list ? `replace tags with ${list}` : "clear tags";
       }
       case "status":
         return `set ${action.value.toLowerCase()}`;
+      case "text": {
+        const field = TEXT_FIELD_LABEL[action.field];
+        switch (action.op) {
+          case "replace":
+            return `${field} "${action.match.find}" → "${action.match.replaceWith}"`;
+          case "append":
+            return `append to ${field}`;
+          case "prepend":
+            return `prepend to ${field}`;
+          case "set":
+            return action.value
+              ? `${field} → ${action.value}`
+              : `clear ${field}`;
+        }
+        return `edit ${field}`;
+      }
+      case "inventory":
+        if (action.field === "tracked") {
+          return action.value ? "track quantity" : "stop tracking quantity";
+        }
+        return action.value
+          ? "continue selling when out of stock"
+          : "stop selling when out of stock";
       default:
         return "edit";
     }
@@ -176,10 +215,26 @@ export function fieldLabel(fieldPath: string): string {
       return "Price";
     case "variant.compareAtPrice":
       return "Compare at price";
+    case "variant.inventoryPolicy":
+      return "When out of stock";
+    case "variant.inventoryItem.tracked":
+      return "Track quantity";
     case "product.tags":
       return "Tags";
     case "product.status":
       return "Status";
+    case "product.title":
+      return "Title";
+    case "product.descriptionHtml":
+      return "Description";
+    case "product.vendor":
+      return "Vendor";
+    case "product.productType":
+      return "Product type";
+    case "product.seo.title":
+      return "SEO title";
+    case "product.seo.description":
+      return "SEO description";
     default:
       return fieldPath;
   }

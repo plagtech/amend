@@ -160,6 +160,7 @@ export default function Index() {
         url: "/app/edit/new",
         disabled: atLimit,
       }}
+      secondaryActions={[{ content: "Templates", url: "/app/templates" }]}
     >
       <TitleBar title="Amend" />
       <BlockStack gap="500">

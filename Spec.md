@@ -200,6 +200,15 @@ Pricing principle: do not go below $19 — in this category cheap signals fragil
 
 **Phase 5 — Remaining actions (days 10-11):** title/description find-replace, SEO fields, inventory, vendor/type, SKU/barcode/weight. Templates page.
 
+> **Built:** find & replace (plain, case toggle, regex) over title, description, vendor, product type and each tag; append/prepend/set on the same fields; SEO title and description with `{{title}}`/`{{vendor}}`/`{{type}}`/`{{handle}}`/`{{tags}}` templating; inventory tracking and out-of-stock policy; saved templates (list, save from the wizard or a finished job, run pre-fills the wizard, free-plan cap of 3).
+>
+> **Not built, deliberately:**
+> - **SKU / barcode / weight.** Variant identity fields, and weight is a `{value, unit}` pair rather than a scalar — a different shape from everything else the diff table renders. Deferred rather than rushed alongside seven other fields.
+> - **Inventory *quantity* adjustment.** A quantity is owned by fulfilment and moves on its own; an undo that restores yesterday's count over today's sales would be worse than no undo. Track/untrack and the out-of-stock policy are settings, and settings restore cleanly. (Note that untracking makes Shopify discard the stocked quantity — undo restores the setting, not the numbers, and the builder says so.)
+> - **Plan-gating regex and the template cap.** The template allowance is enforced from day one; regex mode is built but ungated until billing lands in Phase 6.
+>
+> **Read cost.** Description, SEO and the variant `inventoryItem` are fetched only when an action touches them (`actionsNeedContent` / `actionsNeedInventory`), and the preview scan drops from 25 products per request to 10 when inventory comes along — `inventoryItem` is a nested object, so asking for it on 25×25 nodes lands past Shopify's 1,000-point ceiling and every page of the scan would be rejected. Shopify also rejects an omitted `Boolean!` variable even where the document declares a default for it, so both flags are sent on every request.
+
 **Phase 6 — Billing + polish (days 12-13):** Billing API, plan gating, scheduling + auto-revert (BullMQ delayed jobs), empty states, error states, seed-store QA at 1,000 products. Also: the scheduled sweep that §5 defers — a periodic `resumeStalledJobs` across shops, so a job no longer waits on someone opening the app — and a claim around `reconcileBulkJob`.
 
 **Phase 7 — Submission (day 14):** listing assets, privacy policy, review checklist pass, submit.

@@ -25,6 +25,7 @@ export default function App() {
           Home
         </Link>
         <Link to="/app/edit/new">New bulk edit</Link>
+        <Link to="/app/templates">Templates</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>

@@ -183,11 +183,23 @@ const CURRENT_VALUES_QUERY = `#graphql
         id
         status
         tags
+        title
+        descriptionHtml
+        vendor
+        productType
+        seo {
+          title
+          description
+        }
       }
       ... on ProductVariant {
         id
         price
         compareAtPrice
+        inventoryPolicy
+        inventoryItem {
+          tracked
+        }
         product {
           id
         }
@@ -271,12 +283,21 @@ async function fetchCurrentValues(
 
     for (const node of data.nodes) {
       if (!node) continue;
+      // Keyed by `fieldPath`, so undoing a field is a lookup rather than a
+      // branch — every field added to `actions.ts` needs its live reading here
+      // and nowhere else.
       if (node.__typename === "Product") {
         found.set(node.id, {
           productGid: node.id,
           values: {
             "product.status": node.status,
             "product.tags": node.tags,
+            "product.title": node.title,
+            "product.descriptionHtml": node.descriptionHtml,
+            "product.vendor": node.vendor,
+            "product.productType": node.productType,
+            "product.seo.title": node.seo?.title ?? null,
+            "product.seo.description": node.seo?.description ?? null,
           },
         });
       } else if (node.__typename === "ProductVariant") {
@@ -285,6 +306,9 @@ async function fetchCurrentValues(
           values: {
             "variant.price": node.price,
             "variant.compareAtPrice": node.compareAtPrice,
+            "variant.inventoryPolicy": node.inventoryPolicy,
+            "variant.inventoryItem.tracked":
+              node.inventoryItem?.tracked ?? null,
           },
         });
       }
@@ -299,8 +323,15 @@ interface LiveNode {
   id: string;
   status?: string;
   tags?: string[];
+  title?: string;
+  descriptionHtml?: string | null;
+  vendor?: string;
+  productType?: string;
+  seo?: { title: string | null; description: string | null } | null;
   price?: string;
   compareAtPrice?: string | null;
+  inventoryPolicy?: string;
+  inventoryItem?: { tracked: boolean | null } | null;
   product?: { id: string } | null;
 }
 

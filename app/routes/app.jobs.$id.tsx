@@ -7,7 +7,7 @@
  * the most reliable progress bar is one that reads it.
  */
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import {
@@ -47,13 +47,29 @@ import {
   jobStatusLabel,
   jobStatusTone,
 } from "../lib/jobs";
+import { parseActions } from "../lib/actions";
 import { formatValue } from "../lib/mutations";
-import { fetchOwnerLabels } from "../lib/snapshots.server";
+import { fetchOwnerLabels, parseScope } from "../lib/snapshots.server";
+import { TemplateError, saveTemplate } from "../lib/templates.server";
+import { SaveTemplateModal } from "../components/save-template-modal";
 import { JobRowsTable } from "../components/job-rows";
 import type { JobRowView } from "../components/job-rows";
 
 /** Result rows per page. Enough to scan, short enough to render instantly. */
 const ROWS_PER_PAGE = 50;
+
+/**
+ * Characters of a stored value shown in a result cell.
+ *
+ * A description is a whole document; a table cell is not. The snapshot keeps
+ * every byte — this only clips what is rendered, and matches the same limit the
+ * preview diff table uses so the two read alike.
+ */
+const CELL_LIMIT = 160;
+
+function clip(value: string): string {
+  return value.length > CELL_LIMIT ? `${value.slice(0, CELL_LIMIT)}…` : value;
+}
 
 /** How often an in-flight job re-reads its own state. */
 const POLL_MS = 2000;
@@ -116,8 +132,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       title: label?.title ?? row.ownerGid,
       detail: label?.detail ?? null,
       fieldPath: row.fieldPath,
-      before: formatValue(row.oldValue),
-      after: formatValue(row.newValue),
+      before: clip(formatValue(row.oldValue, row.fieldPath)),
+      after: clip(formatValue(row.newValue, row.fieldPath)),
       applied: row.applied,
       drifted: row.drifted,
       error: row.error,
@@ -165,8 +181,22 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       runJobDetached(shopId, job.id);
       return { ok: true, error: null };
     }
+    // SPEC §6: a job that worked is the most likely thing a merchant wants to
+    // keep, so it can be saved as a template from here without rebuilding it.
+    if (intent === "saveTemplate") {
+      const job = await db.editJob.findFirst({ where: { id: jobId, shopId } });
+      if (!job) throw new JobRequestError("That job no longer exists.");
+      const scope = parseScope(job.filterJson);
+      await saveTemplate({
+        shopId,
+        name: String(form.get("name") ?? job.name),
+        filters: scope.filters,
+        actions: parseActions(JSON.stringify(job.actionsJson)),
+      });
+      return { ok: true, error: null, saved: true };
+    }
   } catch (error) {
-    if (error instanceof JobRequestError) {
+    if (error instanceof JobRequestError || error instanceof TemplateError) {
       return { ok: false, error: error.message };
     }
     throw error;
@@ -179,8 +209,18 @@ export default function JobDetail() {
   const { job, counts, rows, page, onlyFailed, hasNextPage, undoJob, original } =
     useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const fetcher = useFetcher<{ ok: boolean; error: string | null }>();
+  const fetcher = useFetcher<{
+    ok: boolean;
+    error: string | null;
+    saved?: boolean;
+  }>();
   const revalidator = useRevalidator();
+  const [namingTemplate, setNamingTemplate] = useState(false);
+  const savedTemplate = fetcher.data?.saved === true;
+
+  useEffect(() => {
+    if (savedTemplate) setNamingTemplate(false);
+  }, [savedTemplate]);
 
   const active = isActive(job.status);
 
@@ -235,8 +275,8 @@ export default function JobDetail() {
             }
           : undefined
       }
-      secondaryActions={
-        counts.failed > 0 && !active
+      secondaryActions={[
+        ...(counts.failed > 0 && !active
           ? [
               {
                 content: `Retry ${counts.failed} failed row${counts.failed === 1 ? "" : "s"}`,
@@ -245,8 +285,18 @@ export default function JobDetail() {
                 loading: busy,
               },
             ]
-          : undefined
-      }
+          : []),
+        // Not offered for an undo: its actions are carried for display only,
+        // so a template made from one would not describe anything runnable.
+        ...(job.isUndo
+          ? []
+          : [
+              {
+                content: "Save as template",
+                onAction: () => setNamingTemplate(true),
+              },
+            ]),
+      ]}
     >
       <TitleBar title="Job" />
       <Layout>
@@ -255,6 +305,16 @@ export default function JobDetail() {
             {fetcher.data?.error ? (
               <Banner tone="critical">
                 <p>{fetcher.data.error}</p>
+              </Banner>
+            ) : null}
+
+            {savedTemplate ? (
+              <Banner
+                tone="success"
+                title="Saved as a template"
+                action={{ content: "View templates", url: "/app/templates" }}
+              >
+                <p>This edit’s filter and actions are ready to run again.</p>
               </Banner>
             ) : null}
 
@@ -350,6 +410,18 @@ export default function JobDetail() {
           </BlockStack>
         </Layout.Section>
       </Layout>
+
+      <SaveTemplateModal
+        open={namingTemplate}
+        defaultName={job.name}
+        summary="this job’s filter and actions"
+        saving={busy}
+        error={fetcher.data?.error ?? null}
+        onClose={() => setNamingTemplate(false)}
+        onSave={(name) =>
+          fetcher.submit({ intent: "saveTemplate", name }, { method: "POST" })
+        }
+      />
     </Page>
   );
 }

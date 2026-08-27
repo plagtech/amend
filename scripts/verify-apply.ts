@@ -29,7 +29,8 @@ import type { EditJob } from "@prisma/client";
 
 import db from "../app/db.server";
 import type { EditAction } from "../app/lib/actions";
-import { nextPrice, nextTags } from "../app/lib/actions";
+import { emptyMatch, nextProduct, nextVariant } from "../app/lib/actions";
+import type { ProductStatus } from "../app/lib/filters";
 import {
   createApplyJob,
   createUndoJob,
@@ -70,6 +71,24 @@ const VERIFY_TAG = "amend-verify";
 const BULK_TIMEOUT_MS = 10 * 60 * 1000;
 const BULK_POLL_MS = 5_000;
 
+/**
+ * The edit under test: one job, five actions, four shapes of field.
+ *
+ * Price and tags are Phase 4's; the other three are Phase 5's and are here
+ * because each is a different shape of write, and a shape that only ever ran in
+ * a unit test is a shape nobody has proven Shopify accepts:
+ *
+ *   title        a string find & replace on a product field
+ *   SEO title    a *nested* product input (`seo: { title }`), set from a
+ *                template that reads the running title — and set over a field
+ *                that starts null, so undo has to put a null back
+ *   policy       an enum on the variant input, the inventory shape
+ *
+ * `tracked` is deliberately not exercised against the store: untracking a
+ * variant makes Shopify discard its stocked quantity, and the seed store's
+ * quantities are fixtures for `verify:filters`. Its arithmetic is checked
+ * there instead, with no write.
+ */
 const EDIT: EditAction[] = [
   {
     type: "price",
@@ -79,11 +98,39 @@ const EDIT: EditAction[] = [
     amount: "15",
     rounding: "end99",
   },
-  { type: "tags", op: "add", tags: [VERIFY_TAG] },
+  { type: "tags", op: "add", tags: [VERIFY_TAG], match: emptyMatch() },
+  {
+    type: "text",
+    field: "title",
+    op: "replace",
+    match: {
+      find: "Hoodie",
+      replaceWith: "Hooded Top",
+      caseSensitive: true,
+      regex: false,
+    },
+    value: "",
+  },
+  {
+    type: "text",
+    field: "seoTitle",
+    op: "set",
+    match: emptyMatch(),
+    value: "{{title}} | {{vendor}}",
+  },
+  { type: "inventory", field: "policy", value: true },
 ];
 
+/** Product-level rows one selected product produces (tags, title, SEO title). */
+const PRODUCT_ROWS_PER_PRODUCT = 3;
+
+/** Variant-level rows one selected variant produces (price, policy). */
+const VARIANT_ROWS_PER_VARIANT = 2;
+
+/** Variants the seed gives every product — asserted before it is relied on. */
+const SEED_VARIANTS_PER_PRODUCT = 3;
+
 const PRICE_EDIT = EDIT[0] as Extract<EditAction, { type: "price" }>;
-const TAG_EDIT = EDIT[1] as Extract<EditAction, { type: "tags" }>;
 
 // --- harness ----------------------------------------------------------------
 
@@ -154,12 +201,16 @@ interface StoreVariant {
   id: string;
   price: string;
   compareAtPrice: string | null;
+  inventoryPolicy: string;
 }
 
 interface StoreProduct {
   id: string;
   status: string;
   tags: string[];
+  title: string;
+  vendor: string;
+  seoTitle: string | null;
   variants: StoreVariant[];
 }
 
@@ -170,11 +221,17 @@ const STATE_QUERY = `#graphql
         id
         status
         tags
+        title
+        vendor
+        seo {
+          title
+        }
         variants(first: 25) {
           nodes {
             id
             price
             compareAtPrice
+            inventoryPolicy
           }
         }
       }
@@ -183,7 +240,7 @@ const STATE_QUERY = `#graphql
 `;
 
 /** Products per state read. Keeps the nested variant cost well inside budget. */
-const STATE_CHUNK = 40;
+const STATE_CHUNK = 25;
 
 /**
  * The catalog's own account of these products, read fresh from Shopify.
@@ -207,6 +264,9 @@ async function readStore(
           id: string;
           status: string;
           tags: string[];
+          title: string;
+          vendor: string;
+          seo: { title: string | null } | null;
           variants: { nodes: StoreVariant[] };
         } | null)[];
       };
@@ -226,6 +286,12 @@ async function readStore(
         id: node.id,
         status: node.status,
         tags: [...node.tags].sort(),
+        title: node.title,
+        vendor: node.vendor,
+        // An unset SEO title reads as null. It has to stay distinguishable from
+        // "" — restoring one as the other is the same class of bug as putting
+        // $0.00 back where a compare-at price used to be absent.
+        seoTitle: node.seo?.title ?? null,
         variants: node.variants.nodes
           .map((variant) => ({
             id: variant.id,
@@ -235,6 +301,7 @@ async function readStore(
               variant.compareAtPrice === null
                 ? null
                 : money(variant.compareAtPrice),
+            inventoryPolicy: variant.inventoryPolicy,
           }))
           .sort((a, b) => a.id.localeCompare(b.id)),
       });
@@ -259,11 +326,23 @@ function fingerprint(
     .map((id) => state.get(id) ?? { id, missing: true });
 }
 
-/** What the store should look like once `EDIT` has been applied to `selected`. */
+/**
+ * What the store should look like once `EDIT` has been applied to `selected`.
+ *
+ * Computed with `nextProduct`/`nextVariant` — the same pure transforms the
+ * engine snapshotted from. That is deliberate: this script is not checking the
+ * arithmetic (`verify:filters` does that, hand-computed), it is checking that
+ * what those functions produced actually reached the catalog and can be taken
+ * back out of it.
+ *
+ * `productRowsExcludedFor` is the product whose *product-level* row the merchant
+ * unticked in the preview. Its variants still change: an exclusion is per row,
+ * and a product row and its variant rows are different rows.
+ */
 function expectedAfterApply(
   before: Map<string, StoreProduct>,
   selectedIds: Set<string>,
-  tagsExcludedFor: string,
+  productRowsExcludedFor: string,
 ): Map<string, StoreProduct> {
   const after = new Map<string, StoreProduct>();
 
@@ -272,16 +351,50 @@ function expectedAfterApply(
       after.set(id, product);
       continue;
     }
+
+    const excluded = id === productRowsExcludedFor;
+    // Only the fields this edit reads need to be real; `handle`, `productType`
+    // and the description are not touched by `EDIT` and no token refers to them.
+    const next = nextProduct(
+      {
+        id,
+        title: product.title,
+        handle: "",
+        status: product.status as ProductStatus,
+        tags: product.tags,
+        vendor: product.vendor,
+        productType: "",
+        seoTitle: product.seoTitle,
+        variants: [],
+      },
+      EDIT,
+    );
+
     after.set(id, {
       ...product,
-      tags:
-        id === tagsExcludedFor
-          ? product.tags
-          : [...nextTags(product.tags, TAG_EDIT)].sort(),
-      variants: product.variants.map((variant) => ({
-        ...variant,
-        price: nextPrice(variant.price, PRICE_EDIT) ?? variant.price,
-      })),
+      title: excluded ? product.title : next.title,
+      tags: excluded ? product.tags : [...next.tags].sort(),
+      seoTitle: excluded ? product.seoTitle : (next.seoTitle ?? null),
+      variants: product.variants.map((variant) => {
+        const nextVariantState = nextVariant(
+          {
+            id: variant.id,
+            title: "",
+            sku: null,
+            price: variant.price,
+            compareAtPrice: variant.compareAtPrice,
+            inventoryPolicy: variant.inventoryPolicy,
+          },
+          EDIT,
+        );
+        return {
+          ...variant,
+          price: nextVariantState.price,
+          compareAtPrice: nextVariantState.compareAtPrice,
+          inventoryPolicy:
+            nextVariantState.inventoryPolicy ?? variant.inventoryPolicy,
+        };
+      }),
     });
   }
 
@@ -393,6 +506,25 @@ async function main(): Promise<void> {
     const before = await readStore(admin, inScope);
     const beforePrint = fingerprint(before, inScope);
 
+    // The row counts below are constants, and a constant is only an assertion
+    // if the thing it counts is known. This is that: every selected product is
+    // in the state a fresh seed leaves it in, so each one owes exactly three
+    // product rows and two rows per variant.
+    assertTrue(
+      "the seed store is in the state this edit expects",
+      selectedIds.every((id) => {
+        const product = before.get(id);
+        return (
+          !!product &&
+          product.title.includes("Hoodie") &&
+          product.seoTitle === null &&
+          !product.tags.includes(VERIFY_TAG) &&
+          product.variants.length === SEED_VARIANTS_PER_PRODUCT &&
+          product.variants.every((v) => v.inventoryPolicy === "DENY")
+        );
+      }),
+    );
+
     // Reset usage so a re-run isn't refused by the free tier's job allowance.
     await db.shop.upsert({
       where: { id: shop },
@@ -463,9 +595,9 @@ async function main(): Promise<void> {
 
     // --- apply -------------------------------------------------------------
     console.log("\nApply — a real edit through the real engine:");
-    // One product's tag row is excluded, so per-row exclusion is proven to
-    // survive into the write and not just the preview: its prices must move,
-    // its tags must not.
+    // One product's product-level row is excluded, so per-row exclusion is
+    // proven to survive into the write and not just the preview: its prices and
+    // inventory policy must move, its tags, title and SEO title must not.
     const excludedProduct = selectedIds[selectedIds.length - 1];
     const scope: JobScope = {
       filters,
@@ -488,9 +620,12 @@ async function main(): Promise<void> {
     const applied = await runToCompletion(admin, job.id);
 
     const rows = await db.snapshot.findMany({ where: { jobId: job.id } });
-    // Three price rows per product, plus one tag row for every product except
-    // the one whose tag row was excluded.
-    const expectedRows = selectedIds.length * 3 + (selectedIds.length - 1);
+    // Two rows per variant (price, out-of-stock policy) for every selected
+    // product, plus three product rows (tags, title, SEO title) for every one
+    // except the product whose product-level row was excluded.
+    const expectedRows =
+      selectedIds.length * SEED_VARIANTS_PER_PRODUCT * VARIANT_ROWS_PER_VARIANT +
+      (selectedIds.length - 1) * PRODUCT_ROWS_PER_PRODUCT;
 
     check("job completed", applied.status, "completed");
     check("took the expected path", applied.mode, bulk ? "bulk" : "sync");
@@ -526,14 +661,44 @@ async function main(): Promise<void> {
       expectedOnce,
     );
     assertTrue(
-      "the excluded row kept its tags while its prices still moved",
-      !afterApply.get(excludedProduct)!.tags.includes(VERIFY_TAG) &&
-        afterApply
-          .get(excludedProduct)!
-          .variants.some(
+      "the excluded row kept its tags, title and SEO while its variants moved",
+      (() => {
+        const was = before.get(excludedProduct)!;
+        const now = afterApply.get(excludedProduct)!;
+        return (
+          !now.tags.includes(VERIFY_TAG) &&
+          now.title === was.title &&
+          now.seoTitle === null &&
+          now.variants.every(
             (variant, i) =>
-              variant.price !== before.get(excludedProduct)!.variants[i].price,
-          ),
+              variant.price !== was.variants[i].price &&
+              variant.inventoryPolicy === "CONTINUE",
+          )
+        );
+      })(),
+    );
+
+    // Named checks for the Phase 5 shapes, so a failure says which one broke
+    // rather than only "the whole fingerprint differs".
+    const edited = afterApply.get(selectedIds[0])!;
+    const wasEdited = before.get(selectedIds[0])!;
+    assertTrue(
+      "the title find & replace landed",
+      edited.title === wasEdited.title.replace("Hoodie", "Hooded Top") &&
+        edited.title !== wasEdited.title,
+    );
+    check(
+      "the templated SEO title landed, resolved against the new title",
+      edited.seoTitle,
+      `${edited.title} | ${edited.vendor}`,
+    );
+    assertTrue(
+      "every selected variant now continues selling when out of stock",
+      selectedIds.every((id) =>
+        afterApply
+          .get(id)!
+          .variants.every((variant) => variant.inventoryPolicy === "CONTINUE"),
+      ),
     );
     check(
       "unselected products in the same filter were untouched",
@@ -621,10 +786,19 @@ async function main(): Promise<void> {
     check("the undo links back to it", undone.undoOfJobId, job.id);
 
     console.log("\nStore state after undo:");
+    const afterUndo = await readStore(admin, inScope);
     check(
       "catalog is byte-for-byte what it was before the edit",
-      fingerprint(await readStore(admin, inScope), inScope),
+      fingerprint(afterUndo, inScope),
       beforePrint,
+    );
+    // Called out separately because "restore to empty" is the failure mode that
+    // hides inside a fingerprint: an SEO title put back as "" instead of unset
+    // reads as blank in the admin but is a different record, exactly like a
+    // compare-at price restored as $0.00 rather than absent.
+    assertTrue(
+      "an SEO title that was never set is unset again, not blank",
+      selectedIds.every((id) => afterUndo.get(id)!.seoTitle === null),
     );
   } finally {
     // The catalog restores itself via undo; the job rows are this script's

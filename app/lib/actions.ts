@@ -5,7 +5,7 @@
  * Isomorphic on purpose, same as `filters.ts` — the route renders the builder
  * from these types and the loader/action computes diffs with the same code, so
  * the preview a merchant approves is produced by the identical arithmetic that
- * Phase 4 will persist and apply.
+ * Phase 4 persists and applies.
  *
  * Nothing here talks to Shopify. Everything is `(current value, action) =>
  * next value`, which is what makes the preview trustworthy and testable: a
@@ -14,6 +14,15 @@
  * A `PreviewDiff` is deliberately shaped like a `Snapshot` row (`ownerGid`,
  * `fieldPath`, before, after) — Phase 4 persists these verbatim as the undo
  * record rather than recomputing them.
+ *
+ * ## Adding a field (Phase 5 and after)
+ *
+ * Every action type in this file is the same three things: a case in
+ * `nextProduct`/`nextVariant` that computes the next value, an entry in the
+ * field tables below that turns a changed value into a `PreviewDiff`, and a
+ * `fieldPath` the mutation builder knows how to address. Nothing in the engine
+ * changed to add title, description, SEO, inventory, vendor or type — a new
+ * field is a new row in a table here plus the field on the read query.
  */
 
 import type { ProductStatus } from "./filters";
@@ -38,10 +47,32 @@ export interface PriceAction {
   rounding: Rounding;
 }
 
+/**
+ * A find & replace, shared by the text action and the tag action because they
+ * mean exactly the same thing — the only difference is whether it runs over one
+ * string or over each tag in turn.
+ *
+ * `regex` is SPEC §3's "advanced" mode. A pattern that doesn't compile is
+ * treated as "matches nothing" rather than thrown on: a merchant halfway
+ * through typing `(` must get an empty preview, not a broken page.
+ */
+export interface TextMatch {
+  find: string;
+  replaceWith: string;
+  caseSensitive: boolean;
+  regex: boolean;
+}
+
+export function emptyMatch(): TextMatch {
+  return { find: "", replaceWith: "", caseSensitive: false, regex: false };
+}
+
 export interface TagsAction {
   type: "tags";
-  op: "add" | "remove" | "replace";
+  op: "add" | "remove" | "replace" | "findReplace";
   tags: string[];
+  /** `findReplace` only; ignored by the other ops. */
+  match: TextMatch;
 }
 
 export interface StatusAction {
@@ -49,17 +80,89 @@ export interface StatusAction {
   value: ProductStatus;
 }
 
-export type EditAction = PriceAction | TagsAction | StatusAction;
+/**
+ * Product text fields, all edited the same four ways.
+ *
+ * Vendor and product type are here rather than in an action of their own
+ * because "set vendor to X" is `op: "set"` on this action — and having them
+ * here means find & replace works on them too, which is free and is what a
+ * merchant renaming a vendor across 400 products actually wants.
+ */
+export type TextTarget =
+  | "title"
+  | "description"
+  | "seoTitle"
+  | "seoDescription"
+  | "vendor"
+  | "productType";
+
+export type TextOp = "replace" | "append" | "prepend" | "set";
+
+export interface TextAction {
+  type: "text";
+  field: TextTarget;
+  op: TextOp;
+  /** `replace` only. */
+  match: TextMatch;
+  /** `append` / `prepend` / `set`. Supports `{{title}}`-style tokens. */
+  value: string;
+}
+
+/**
+ * The two inventory settings SPEC §3 asks for: whether Shopify tracks the
+ * quantity, and whether it keeps selling at zero.
+ *
+ * Deliberately not quantity adjustment. A quantity is a moving number owned by
+ * fulfilment, and an undo that restores yesterday's count over today's sales
+ * would be worse than no undo at all — the one thing this app promises is that
+ * reversing an edit is safe.
+ */
+export type InventoryField = "tracked" | "policy";
+
+export interface InventoryAction {
+  type: "inventory";
+  field: InventoryField;
+  /** tracked: is quantity tracked. policy: keep selling when out of stock. */
+  value: boolean;
+}
+
+export type EditAction =
+  | PriceAction
+  | TagsAction
+  | StatusAction
+  | TextAction
+  | InventoryAction;
+
 export type ActionType = EditAction["type"];
 
-export const ACTION_TYPES: { type: ActionType; label: string }[] = [
-  { type: "price", label: "Price" },
-  { type: "tags", label: "Tags" },
-  { type: "status", label: "Status" },
+/**
+ * The "Add action" menu.
+ *
+ * Keyed separately from `EditAction["type"]` because three menu entries create
+ * the same kind of action pointed at different fields — a merchant looking for
+ * SEO should not have to know that it is the same machinery as the title.
+ */
+export type ActionMenuKey =
+  | "price"
+  | "tags"
+  | "status"
+  | "content"
+  | "seo"
+  | "organization"
+  | "inventory";
+
+export const ACTION_TYPES: { key: ActionMenuKey; label: string }[] = [
+  { key: "price", label: "Price" },
+  { key: "tags", label: "Tags" },
+  { key: "status", label: "Status" },
+  { key: "content", label: "Title & description" },
+  { key: "seo", label: "SEO" },
+  { key: "organization", label: "Vendor & type" },
+  { key: "inventory", label: "Inventory" },
 ];
 
-export function newAction(type: ActionType): EditAction {
-  switch (type) {
+export function newAction(key: ActionMenuKey): EditAction {
+  switch (key) {
     case "price":
       return {
         type: "price",
@@ -70,9 +173,35 @@ export function newAction(type: ActionType): EditAction {
         rounding: "none",
       };
     case "tags":
-      return { type: "tags", op: "add", tags: [] };
+      return { type: "tags", op: "add", tags: [], match: emptyMatch() };
     case "status":
       return { type: "status", value: "ACTIVE" };
+    case "content":
+      return {
+        type: "text",
+        field: "title",
+        op: "replace",
+        match: emptyMatch(),
+        value: "",
+      };
+    case "seo":
+      return {
+        type: "text",
+        field: "seoTitle",
+        op: "set",
+        match: emptyMatch(),
+        value: "",
+      };
+    case "organization":
+      return {
+        type: "text",
+        field: "vendor",
+        op: "set",
+        match: emptyMatch(),
+        value: "",
+      };
+    case "inventory":
+      return { type: "inventory", field: "policy", value: true };
   }
 }
 
@@ -86,22 +215,72 @@ export function isActionComplete(action: EditAction): boolean {
     case "price":
       return parseAmount(action.amount) !== null;
     case "tags":
+      if (action.op === "findReplace") return action.match.find !== "";
       // "replace" with an empty list is meaningful: it clears every tag.
       return action.op === "replace" || action.tags.length > 0;
     case "status":
       return true;
+    case "text":
+      if (action.op === "replace") return action.match.find !== "";
+      // An empty `set` on an optional field is a real instruction — that is how
+      // an SEO override or a description gets cleared. An empty `set` on the
+      // title is not: it would blank the product name, and no merchant means
+      // that by leaving a box empty.
+      return action.value !== "" || (action.op === "set" && CLEARABLE.has(action.field));
+    case "inventory":
+      return true;
   }
 }
 
+/** Text fields where "set to nothing" means "clear it", not "unfinished". */
+const CLEARABLE = new Set<TextTarget>([
+  "description",
+  "seoTitle",
+  "seoDescription",
+]);
+
 /** Only variant-scoped actions need variants fetched to preview them. */
 export function actionsTouchVariants(actions: EditAction[]): boolean {
-  return actions.some((action) => action.type === "price");
+  return actions.some(
+    (action) => action.type === "price" || action.type === "inventory",
+  );
 }
 
 export function actionsTouchProducts(actions: EditAction[]): boolean {
   return actions.some(
-    (action) => action.type === "tags" || action.type === "status",
+    (action) =>
+      action.type === "tags" ||
+      action.type === "status" ||
+      action.type === "text",
   );
+}
+
+/**
+ * Whether the product scan has to pay for the expensive content fields.
+ *
+ * Title, vendor and product type are on every product read anyway; description
+ * and SEO are not, and description in particular is the largest field on the
+ * record. Fetching them only when an action touches them keeps a plain price
+ * edit as cheap as it was before Phase 5.
+ */
+export function actionsNeedContent(actions: EditAction[]): boolean {
+  return actions.some(
+    (action) =>
+      action.type === "text" &&
+      (action.field === "description" ||
+        action.field === "seoTitle" ||
+        action.field === "seoDescription"),
+  );
+}
+
+/**
+ * Whether variants have to carry their inventory settings.
+ *
+ * `inventoryItem` is a nested object, so asking for it multiplies the query
+ * cost of every variant on every page — see `PREVIEW_PAGE_WITH_INVENTORY`.
+ */
+export function actionsNeedInventory(actions: EditAction[]): boolean {
+  return actions.some((action) => action.type === "inventory");
 }
 
 // --- serialization ----------------------------------------------------------
@@ -109,8 +288,9 @@ export function actionsTouchProducts(actions: EditAction[]): boolean {
 /**
  * Actions round-trip as one JSON blob rather than as flat search params: they
  * are an ordered, heterogeneous list, and this is the exact shape that lands in
- * `EditJob.actionsJson`. Unknown or malformed entries are dropped rather than
- * thrown on, so a hand-edited URL degrades to "fewer actions" instead of a
+ * `EditJob.actionsJson` and `SavedTemplate.actionsJson`. Unknown or malformed
+ * entries are dropped rather than thrown on, so a hand-edited URL — or a
+ * template saved by an older version — degrades to "fewer actions" instead of a
  * broken page.
  */
 export function parseActions(raw: string | null | undefined): EditAction[] {
@@ -157,11 +337,15 @@ function coerceAction(entry: unknown): EditAction | null {
 
   if (record.type === "tags") {
     const op =
-      record.op === "remove" || record.op === "replace" ? record.op : "add";
+      record.op === "remove" ||
+      record.op === "replace" ||
+      record.op === "findReplace"
+        ? record.op
+        : "add";
     const tags = Array.isArray(record.tags)
       ? record.tags.filter((tag): tag is string => typeof tag === "string")
       : [];
-    return { type: "tags", op, tags };
+    return { type: "tags", op, tags, match: coerceMatch(record.match) };
   }
 
   if (record.type === "status") {
@@ -173,10 +357,56 @@ function coerceAction(entry: unknown): EditAction | null {
     return { type: "status", value };
   }
 
+  if (record.type === "text") {
+    const field = TEXT_TARGETS.includes(record.field as TextTarget)
+      ? (record.field as TextTarget)
+      : "title";
+    const op = TEXT_OPS.includes(record.op as TextOp)
+      ? (record.op as TextOp)
+      : "replace";
+    return {
+      type: "text",
+      field,
+      op,
+      match: coerceMatch(record.match),
+      value: typeof record.value === "string" ? record.value : "",
+    };
+  }
+
+  if (record.type === "inventory") {
+    return {
+      type: "inventory",
+      field: record.field === "tracked" ? "tracked" : "policy",
+      value: record.value !== false,
+    };
+  }
+
   return null;
 }
 
+function coerceMatch(value: unknown): TextMatch {
+  const record = (value ?? {}) as Record<string, unknown>;
+  return {
+    find: typeof record.find === "string" ? record.find : "",
+    replaceWith:
+      typeof record.replaceWith === "string" ? record.replaceWith : "",
+    caseSensitive: record.caseSensitive === true,
+    regex: record.regex === true,
+  };
+}
+
 const ROUNDINGS: Rounding[] = ["none", "end99", "end95", "end00"];
+
+const TEXT_TARGETS: TextTarget[] = [
+  "title",
+  "description",
+  "seoTitle",
+  "seoDescription",
+  "vendor",
+  "productType",
+];
+
+const TEXT_OPS: TextOp[] = ["replace", "append", "prepend", "set"];
 
 /** Identity of an action set — used to drop a stale preview when it changes. */
 export function actionsSignature(actions: EditAction[]): string {
@@ -258,6 +488,116 @@ export function nextPrice(
   return fromCents(Math.max(0, applyRounding(Math.max(0, raw), action.rounding)));
 }
 
+// --- text -------------------------------------------------------------------
+
+/**
+ * What `{{title}}`-style tokens resolve to (SPEC §3, SEO templating).
+ *
+ * Read from the *running* values rather than the original ones, so an action
+ * stack that renames a product and then templates its SEO title off `{{title}}`
+ * uses the new name. That is the order the merchant wrote them in.
+ */
+export interface TokenContext {
+  title: string;
+  vendor: string;
+  productType: string;
+  handle: string;
+  tags: string[];
+}
+
+const TOKEN_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g;
+
+/**
+ * Expand tokens in a template.
+ *
+ * An unknown token is left standing rather than blanked. A merchant who typed
+ * `{{titel}}` sees `{{titel}}` in the preview and fixes it; blanking it would
+ * silently write a truncated SEO title across their catalog.
+ */
+export function expandTokens(template: string, tokens: TokenContext): string {
+  return template.replace(TOKEN_PATTERN, (whole, name: string) => {
+    switch (name.toLowerCase()) {
+      case "title":
+        return tokens.title;
+      case "vendor":
+        return tokens.vendor;
+      case "type":
+      case "producttype":
+        return tokens.productType;
+      case "handle":
+        return tokens.handle;
+      case "tags":
+        return tokens.tags.join(", ");
+      default:
+        return whole;
+    }
+  });
+}
+
+export const TOKEN_HELP = "{{title}} · {{vendor}} · {{type}} · {{handle}} · {{tags}}";
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Compile a match, or null if it cannot be compiled.
+ *
+ * Always global: "find and replace" means every occurrence, which is what
+ * competitors' "add text to the end" cannot do and what SPEC §1 calls out as a
+ * wedge. Case-insensitive by default, per SPEC §3.
+ */
+function compileMatch(match: TextMatch): RegExp | null {
+  if (!match.find) return null;
+  try {
+    return new RegExp(
+      match.regex ? match.find : escapeRegExp(match.find),
+      match.caseSensitive ? "g" : "gi",
+    );
+  } catch {
+    // An unfinished or invalid pattern matches nothing. Throwing here would
+    // take down a preview the merchant is still typing into.
+    return null;
+  }
+}
+
+/**
+ * One find & replace over one string.
+ *
+ * In plain mode the replacement is escaped, so a merchant replacing something
+ * with "$5" gets "$5" and not JavaScript's `$5` capture-group substitution. In
+ * regex mode it is not escaped — `$1` there is the point.
+ */
+export function replaceIn(current: string, match: TextMatch): string {
+  const pattern = compileMatch(match);
+  if (!pattern) return current;
+  const replacement = match.regex
+    ? match.replaceWith
+    : match.replaceWith.replace(/\$/g, "$$$$");
+  return current.replace(pattern, replacement);
+}
+
+/** The new value for one text field. */
+export function nextText(
+  current: string,
+  action: TextAction,
+  tokens: TokenContext,
+): string {
+  switch (action.op) {
+    case "replace":
+      return replaceIn(current, {
+        ...action.match,
+        replaceWith: expandTokens(action.match.replaceWith, tokens),
+      });
+    case "append":
+      return current + expandTokens(action.value, tokens);
+    case "prepend":
+      return expandTokens(action.value, tokens) + current;
+    case "set":
+      return expandTokens(action.value, tokens);
+  }
+}
+
 // --- tags -------------------------------------------------------------------
 
 /** Tag matching is case-insensitive, but the merchant's casing is what sticks. */
@@ -276,6 +616,23 @@ export function nextTags(current: string[], action: TagsAction): string[] {
     }
     case "replace":
       return clean;
+    case "findReplace": {
+      // Two tags can collapse into one, and a tag can be replaced with nothing.
+      // Shopify would silently dedupe the first and reject nothing for the
+      // second, so both are resolved here — otherwise the snapshot would record
+      // a tag list the catalog never actually held, and undo would restore it.
+      const seen = new Set<string>();
+      const next: string[] = [];
+      for (const tag of current) {
+        const replaced = replaceIn(tag, action.match).trim();
+        if (!replaced) continue;
+        const key = replaced.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        next.push(replaced);
+      }
+      return next;
+    }
   }
 }
 
@@ -311,11 +668,25 @@ export interface PreviewRow {
   diffs: PreviewDiff[];
 }
 
+/**
+ * What the preview reads off a product.
+ *
+ * `undefined` on an optional field means "the scan did not fetch this", which
+ * is different from `null` ("the product has no SEO title"). The difference
+ * matters: a diff computed against a field we never read would record a false
+ * before-value, and undo would restore it. Anything `undefined` is skipped.
+ */
 export interface DiffProduct {
   id: string;
   title: string;
+  handle: string;
   status: ProductStatus;
   tags: string[];
+  vendor: string;
+  productType: string;
+  descriptionHtml?: string | null;
+  seoTitle?: string | null;
+  seoDescription?: string | null;
   variants: DiffVariant[];
 }
 
@@ -325,12 +696,135 @@ export interface DiffVariant {
   sku: string | null;
   price: string;
   compareAtPrice: string | null;
+  /** "CONTINUE" | "DENY". Absent unless the scan asked for inventory. */
+  inventoryPolicy?: string | null;
+  tracked?: boolean | null;
 }
+
+/** The mutable half of a product — what an action stack produces. */
+export type ProductState = Pick<
+  DiffProduct,
+  | "title"
+  | "status"
+  | "tags"
+  | "vendor"
+  | "productType"
+  | "descriptionHtml"
+  | "seoTitle"
+  | "seoDescription"
+>;
+
+export type VariantState = Pick<
+  DiffVariant,
+  "price" | "compareAtPrice" | "inventoryPolicy" | "tracked"
+>;
 
 const PRICE_LABEL: Record<PriceField, string> = {
   price: "Price",
   compareAtPrice: "Compare at price",
 };
+
+/**
+ * Product text fields, in the order they appear in a diff row.
+ *
+ * One table drives three things — which action targets which field, which
+ * `fieldPath` the snapshot records, and what the merchant sees — so a field can
+ * never be renamed in one place and not the others.
+ */
+const PRODUCT_TEXT_FIELDS: {
+  key: keyof ProductState;
+  fieldPath: string;
+  label: string;
+}[] = [
+  { key: "title", fieldPath: "product.title", label: "Title" },
+  {
+    key: "descriptionHtml",
+    fieldPath: "product.descriptionHtml",
+    label: "Description",
+  },
+  { key: "vendor", fieldPath: "product.vendor", label: "Vendor" },
+  {
+    key: "productType",
+    fieldPath: "product.productType",
+    label: "Product type",
+  },
+  { key: "seoTitle", fieldPath: "product.seo.title", label: "SEO title" },
+  {
+    key: "seoDescription",
+    fieldPath: "product.seo.description",
+    label: "SEO description",
+  },
+];
+
+/** Where a `TextTarget` lives on a `ProductState`. */
+const TARGET_KEY: Record<TextTarget, keyof ProductState> = {
+  title: "title",
+  description: "descriptionHtml",
+  seoTitle: "seoTitle",
+  seoDescription: "seoDescription",
+  vendor: "vendor",
+  productType: "productType",
+};
+
+/** Fields where an empty string and "not set" are the same thing to Shopify. */
+const NULL_WHEN_EMPTY = new Set<keyof ProductState>([
+  "seoTitle",
+  "seoDescription",
+]);
+
+/**
+ * Run an action stack over one product. Pure, and the single source of what an
+ * edit means — `productDiffs` only compares this against what came in, and
+ * `scripts/verify-apply.ts` uses it to predict the catalog it then reads back.
+ */
+export function nextProduct(
+  product: DiffProduct,
+  actions: EditAction[],
+): ProductState {
+  const state: ProductState = {
+    title: product.title,
+    status: product.status,
+    tags: product.tags,
+    vendor: product.vendor,
+    productType: product.productType,
+    descriptionHtml: product.descriptionHtml,
+    seoTitle: product.seoTitle,
+    seoDescription: product.seoDescription,
+  };
+
+  for (const action of actions) {
+    if (!isActionComplete(action)) continue;
+    if (action.type === "tags") state.tags = nextTags(state.tags, action);
+    if (action.type === "status") state.status = action.value;
+    if (action.type === "text") applyText(state, action, product.handle);
+  }
+
+  return state;
+}
+
+function applyText(
+  state: ProductState,
+  action: TextAction,
+  handle: string,
+): void {
+  const key = TARGET_KEY[action.field];
+  const current = state[key];
+  // The scan didn't fetch this field, so there is no before-value to edit from.
+  // Skipping is the safe direction: a missing diff writes nothing.
+  if (current === undefined) return;
+  if (typeof current !== "string" && current !== null) return;
+
+  const next = nextText(current ?? "", action, {
+    title: state.title,
+    vendor: state.vendor,
+    productType: state.productType,
+    handle,
+    tags: state.tags,
+  });
+
+  (state[key] as string | null) =
+    next === "" && NULL_WHEN_EMPTY.has(key) ? null : next;
+}
 
 /**
  * Product-level diffs for one product. Returns an empty list when the actions
@@ -341,82 +835,153 @@ export function productDiffs(
   product: DiffProduct,
   actions: EditAction[],
 ): PreviewDiff[] {
-  let tags = product.tags;
-  let status = product.status;
-
-  for (const action of actions) {
-    if (!isActionComplete(action)) continue;
-    if (action.type === "tags") tags = nextTags(tags, action);
-    if (action.type === "status") status = action.value;
-  }
-
+  const next = nextProduct(product, actions);
   const diffs: PreviewDiff[] = [];
-  if (!sameTags(product.tags, tags)) {
+
+  if (!sameTags(product.tags, next.tags)) {
     diffs.push({
       fieldPath: "product.tags",
       label: "Tags",
       before: product.tags.join(", ") || "—",
-      after: tags.join(", ") || "—",
+      after: next.tags.join(", ") || "—",
       rawBefore: JSON.stringify(product.tags),
-      rawAfter: JSON.stringify(tags),
+      rawAfter: JSON.stringify(next.tags),
     });
   }
-  if (status !== product.status) {
+  if (next.status !== product.status) {
     diffs.push({
       fieldPath: "product.status",
       label: "Status",
       before: product.status,
-      after: status,
+      after: next.status,
       rawBefore: JSON.stringify(product.status),
-      rawAfter: JSON.stringify(status),
+      rawAfter: JSON.stringify(next.status),
     });
   }
+
+  for (const field of PRODUCT_TEXT_FIELDS) {
+    const before = product[field.key as keyof DiffProduct] as
+      | string
+      | null
+      | undefined;
+    const after = next[field.key] as string | null | undefined;
+    if (before === undefined || after === undefined) continue;
+    if ((before ?? null) === (after ?? null)) continue;
+    diffs.push({
+      fieldPath: field.fieldPath,
+      label: field.label,
+      before: display(before),
+      after: display(after),
+      rawBefore: JSON.stringify(before ?? null),
+      rawAfter: JSON.stringify(after ?? null),
+    });
+  }
+
   return diffs;
+}
+
+export function nextVariant(
+  variant: DiffVariant,
+  actions: EditAction[],
+): VariantState {
+  const state: VariantState = {
+    price: variant.price,
+    compareAtPrice: variant.compareAtPrice,
+    inventoryPolicy: variant.inventoryPolicy,
+    tracked: variant.tracked,
+  };
+
+  for (const action of actions) {
+    if (!isActionComplete(action)) continue;
+
+    if (action.type === "price") {
+      if (action.field === "price") {
+        state.price = nextPrice(state.price, action) ?? state.price;
+      } else {
+        state.compareAtPrice =
+          nextPrice(state.compareAtPrice, action) ?? state.compareAtPrice;
+      }
+      continue;
+    }
+
+    // As with text fields: a setting the scan didn't read has no before-value,
+    // so it is left alone rather than guessed at.
+    if (action.type === "inventory") {
+      if (action.field === "policy") {
+        if (state.inventoryPolicy === undefined) continue;
+        state.inventoryPolicy = action.value ? "CONTINUE" : "DENY";
+      } else {
+        if (state.tracked === undefined || state.tracked === null) continue;
+        state.tracked = action.value;
+      }
+    }
+  }
+
+  return state;
 }
 
 export function variantDiffs(
   variant: DiffVariant,
   actions: EditAction[],
 ): PreviewDiff[] {
-  let price = variant.price;
-  let compareAt = variant.compareAtPrice;
-
-  for (const action of actions) {
-    if (action.type !== "price" || !isActionComplete(action)) continue;
-    if (action.field === "price") {
-      price = nextPrice(price, action) ?? price;
-    } else {
-      compareAt = nextPrice(compareAt, action) ?? compareAt;
-    }
-  }
-
+  const next = nextVariant(variant, actions);
   const diffs: PreviewDiff[] = [];
-  if (!sameMoney(variant.price, price)) {
+
+  if (!sameMoney(variant.price, next.price)) {
     diffs.push({
       fieldPath: "variant.price",
       label: PRICE_LABEL.price,
       before: variant.price,
-      after: price,
+      after: next.price,
       rawBefore: JSON.stringify(variant.price),
-      rawAfter: JSON.stringify(price),
+      rawAfter: JSON.stringify(next.price),
     });
   }
-  if (!sameMoney(variant.compareAtPrice, compareAt)) {
+  if (!sameMoney(variant.compareAtPrice, next.compareAtPrice)) {
     diffs.push({
       fieldPath: "variant.compareAtPrice",
       label: PRICE_LABEL.compareAtPrice,
       before: variant.compareAtPrice ?? "—",
-      after: compareAt ?? "—",
+      after: next.compareAtPrice ?? "—",
       rawBefore: JSON.stringify(variant.compareAtPrice),
-      rawAfter: JSON.stringify(compareAt),
+      rawAfter: JSON.stringify(next.compareAtPrice),
     });
   }
+  if (
+    variant.inventoryPolicy !== undefined &&
+    next.inventoryPolicy !== undefined &&
+    variant.inventoryPolicy !== next.inventoryPolicy
+  ) {
+    diffs.push({
+      fieldPath: "variant.inventoryPolicy",
+      label: "When out of stock",
+      before: policyLabel(variant.inventoryPolicy),
+      after: policyLabel(next.inventoryPolicy),
+      rawBefore: JSON.stringify(variant.inventoryPolicy),
+      rawAfter: JSON.stringify(next.inventoryPolicy),
+    });
+  }
+  if (
+    typeof variant.tracked === "boolean" &&
+    typeof next.tracked === "boolean" &&
+    variant.tracked !== next.tracked
+  ) {
+    diffs.push({
+      fieldPath: "variant.inventoryItem.tracked",
+      label: "Track quantity",
+      before: variant.tracked ? "Yes" : "No",
+      after: next.tracked ? "Yes" : "No",
+      rawBefore: JSON.stringify(variant.tracked),
+      rawAfter: JSON.stringify(next.tracked),
+    });
+  }
+
   return diffs;
 }
 
 /**
- * Every changed row for one product: the product itself when tags or status
- * move, plus one row per variant whose money changed.
+ * Every changed row for one product: the product itself when a product-level
+ * field moves, plus one row per variant whose variant-level fields moved.
  *
  * `variantScope` is the set of variant GIDs the merchant actually selected — in
  * variant view a price edit must not spill onto the siblings of a selected
@@ -458,6 +1023,22 @@ export function previewRowsForProduct(
   }
 
   return rows;
+}
+
+/** Diff-table rendering of a text value. Long HTML is clipped, never the raw. */
+function display(value: string | null): string {
+  if (value === null || value === "") return "—";
+  return value.length > DISPLAY_LIMIT
+    ? `${value.slice(0, DISPLAY_LIMIT)}…`
+    : value;
+}
+
+const DISPLAY_LIMIT = 160;
+
+function policyLabel(policy: string | null | undefined): string {
+  if (policy === "CONTINUE") return "Continue selling";
+  if (policy === "DENY") return "Stop selling";
+  return policy ?? "—";
 }
 
 function sameTags(before: string[], after: string[]): boolean {
