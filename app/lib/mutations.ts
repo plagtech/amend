@@ -13,6 +13,8 @@
  * turns a userError into "these three variants failed, and why".
  */
 
+import { coerceWeight, formatWeight } from "./actions";
+
 /**
  * The mutation types a job runs, in order.
  *
@@ -104,6 +106,8 @@ export function formatValue(raw: string, fieldPath?: string): string {
   if (value === null || value === undefined || value === "") return "—";
   if (Array.isArray(value)) return value.join(", ") || "—";
   if (typeof value === "boolean") return value ? "Yes" : "No";
+  // A weight is one value with two parts; it reads back as one string.
+  if (typeof value === "object") return formatWeight(coerceWeight(value));
   if (fieldPath === "variant.inventoryPolicy") {
     if (value === "CONTINUE") return "Continue selling";
     if (value === "DENY") return "Stop selling";

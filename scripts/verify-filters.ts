@@ -27,12 +27,15 @@ import type {
   DiffProduct,
   EditAction,
   TextAction,
+  VariantTextAction,
 } from "../app/lib/actions";
 import {
+  convertWeight,
   emptyMatch,
   nextPrice,
   nextTags,
   productDiffs,
+  scopedSkus,
   variantDiffs,
 } from "../app/lib/actions";
 import { emptyFilters } from "../app/lib/filters";
@@ -421,8 +424,10 @@ async function verifyPreview(
         sku: "AMD-HOO-0042-S",
         price: "40.00",
         compareAtPrice: null,
+        barcode: "AMD-HOO-0042-1-BC",
         inventoryPolicy: "DENY",
         tracked: true,
+        weight: { value: 1.2, unit: "KILOGRAMS" },
       },
     ],
   };
@@ -602,6 +607,148 @@ async function verifyPreview(
       ],
     ),
     [],
+  );
+
+  // --- SKU, barcode and weight --------------------------------------------
+  console.log("\nSKU, barcode and weight arithmetic:");
+
+  const variant = product.variants[0];
+  const raws = (diffs: { fieldPath: string; rawAfter: string }[]) =>
+    diffs.map((diff) => [diff.fieldPath, diff.rawAfter]);
+
+  const sku = (over: Partial<VariantTextAction>): VariantTextAction => ({
+    type: "variantText",
+    field: "sku",
+    op: "replace",
+    match: emptyMatch(),
+    value: "",
+    ...over,
+  });
+
+  check(
+    "SKU find & replace — the prefix reformat case",
+    paths(
+      variantDiffs(variant, [
+        sku({ match: { ...emptyMatch(), find: "AMD-HOO", replaceWith: "AMD-HOOD" } }),
+      ]),
+    ),
+    [["variant.inventoryItem.sku", "AMD-HOOD-0042-S"]],
+  );
+  check(
+    "SKU writes through inventoryItem, not the variant input",
+    variantDiffs(variant, [sku({ op: "set", value: "NEW-SKU" })])[0].fieldPath,
+    "variant.inventoryItem.sku",
+  );
+  check(
+    "a SKU find that matches nothing is not a change",
+    variantDiffs(variant, [
+      sku({ match: { ...emptyMatch(), find: "AMD-CAP", replaceWith: "X" } }),
+    ]),
+    [],
+  );
+  check(
+    "clearing a barcode records null, not an empty string",
+    raws(variantDiffs(variant, [sku({ field: "barcode", op: "clear" })])),
+    [["variant.barcode", "null"]],
+  );
+  check(
+    "a replace that empties a barcode records null too",
+    raws(
+      variantDiffs(variant, [
+        sku({
+          field: "barcode",
+          match: {
+            ...emptyMatch(),
+            find: "AMD-HOO-0042-1-BC",
+            replaceWith: "",
+          },
+        }),
+      ]),
+    ),
+    [["variant.barcode", "null"]],
+  );
+  check(
+    "clearing a barcode that is already unset is not a change",
+    variantDiffs({ ...variant, barcode: null }, [
+      sku({ field: "barcode", op: "clear" }),
+    ]),
+    [],
+  );
+  check(
+    "weight set carries value and unit as one row",
+    raws(
+      variantDiffs(variant, [
+        { type: "weight", op: "set", value: "500", unit: "GRAMS" },
+      ]),
+    ),
+    [
+      [
+        "variant.inventoryItem.measurement.weight",
+        JSON.stringify({ value: 500, unit: "GRAMS" }),
+      ],
+    ],
+  );
+  check(
+    "weight reads as one column",
+    variantDiffs(variant, [
+      { type: "weight", op: "set", value: "500", unit: "GRAMS" },
+    ]).map((diff) => `${diff.before} → ${diff.after}`),
+    ["1.2 kg → 500 g"],
+  );
+  check(
+    "kg → g converts exactly",
+    convertWeight({ value: 1.2, unit: "KILOGRAMS" }, "GRAMS"),
+    { value: 1200, unit: "GRAMS" },
+  );
+  check(
+    "lb → oz converts exactly",
+    convertWeight({ value: 1, unit: "POUNDS" }, "OUNCES"),
+    { value: 16, unit: "OUNCES" },
+  );
+  check(
+    "converting to the unit it already has is not a change",
+    variantDiffs(variant, [
+      { type: "weight", op: "convert", value: "", unit: "KILOGRAMS" },
+    ]),
+    [],
+  );
+  check(
+    "a variant with no weight is left alone — undo could not take one back off",
+    variantDiffs({ ...variant, weight: null }, [
+      { type: "weight", op: "set", value: "500", unit: "GRAMS" },
+    ]),
+    [],
+  );
+  check(
+    "a weight the scan never read is never diffed",
+    variantDiffs({ ...variant, weight: undefined }, [
+      { type: "weight", op: "set", value: "500", unit: "GRAMS" },
+    ]),
+    [],
+  );
+
+  // Shopify accepts duplicate SKUs without a userError, so the preview is the
+  // only thing that will ever mention them.
+  const twoVariants: DiffProduct = {
+    ...product,
+    variants: [
+      { ...variant, id: "gid://shopify/ProductVariant/1", sku: "AMD-HOO-0042-S" },
+      { ...variant, id: "gid://shopify/ProductVariant/2", sku: "AMD-HOO-0042-M" },
+    ],
+  };
+  check(
+    "a replace that collapses two SKUs into one is detectable",
+    scopedSkus(
+      twoVariants,
+      [sku({ match: { ...emptyMatch(), find: "-S|-M", replaceWith: "", regex: true, caseSensitive: true } })],
+      null,
+    ),
+    ["AMD-HOO-0042", "AMD-HOO-0042"],
+  );
+  check(
+    "and an untouched selection stays distinct",
+    scopedSkus(twoVariants, [sku({ match: { ...emptyMatch(), find: "AMD", replaceWith: "AMD" } })], null),
+    ["AMD-HOO-0042-S", "AMD-HOO-0042-M"],
   );
 
   // --- end to end, against the seeded store --------------------------------

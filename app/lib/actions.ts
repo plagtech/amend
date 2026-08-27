@@ -126,12 +126,72 @@ export interface InventoryAction {
   value: boolean;
 }
 
+/**
+ * SKU and barcode: the variant-level text fields.
+ *
+ * Separate from `TextAction` because they are a different scope — these are
+ * written by `productVariantsBulkUpdate` and everything in `TextAction` by
+ * `productUpdate` — and because they take no `{{token}}`s. A token expands from
+ * the product, and a SKU templated identically across a product's variants
+ * would be a worse answer than the one the merchant meant.
+ *
+ * `clear` is offered for the barcode only. Shopify collapses an empty barcode
+ * to null (probed on 2026-07: writing `""` reads back as `null`), so clearing
+ * has to record null as the new value or the snapshot would describe a state the
+ * catalog is not in and every undo would report drift.
+ */
+export type VariantTextTarget = "sku" | "barcode";
+export type VariantTextOp = "replace" | "set" | "clear";
+
+export interface VariantTextAction {
+  type: "variantText";
+  field: VariantTextTarget;
+  op: VariantTextOp;
+  /** `replace` only. */
+  match: TextMatch;
+  /** `set` only. */
+  value: string;
+}
+
+export const WEIGHT_UNITS = [
+  "KILOGRAMS",
+  "GRAMS",
+  "POUNDS",
+  "OUNCES",
+] as const;
+export type WeightUnit = (typeof WEIGHT_UNITS)[number];
+
+/** A variant's shipping weight. Both halves or neither — never one. */
+export interface Weight {
+  value: number;
+  unit: WeightUnit;
+}
+
+/**
+ * Weight is one logical value, so it is one action, one diff column and one
+ * snapshot row holding `{value, unit}` together. Splitting it would let an undo
+ * restore 500 with the unit already back to pounds.
+ *
+ * `convert` changes the unit and carries the value across exactly; `set` writes
+ * both. No percentage or relative arithmetic — a bulk editor that quietly
+ * reweighs a catalog by 10% is not a feature anyone asked for.
+ */
+export interface WeightAction {
+  type: "weight";
+  op: "set" | "convert";
+  /** `set` only. Kept as a string so a half-typed "1." survives. */
+  value: string;
+  unit: WeightUnit;
+}
+
 export type EditAction =
   | PriceAction
   | TagsAction
   | StatusAction
   | TextAction
-  | InventoryAction;
+  | InventoryAction
+  | VariantTextAction
+  | WeightAction;
 
 export type ActionType = EditAction["type"];
 
@@ -149,7 +209,9 @@ export type ActionMenuKey =
   | "content"
   | "seo"
   | "organization"
-  | "inventory";
+  | "inventory"
+  | "identifiers"
+  | "weight";
 
 export const ACTION_TYPES: { key: ActionMenuKey; label: string }[] = [
   { key: "price", label: "Price" },
@@ -159,6 +221,8 @@ export const ACTION_TYPES: { key: ActionMenuKey; label: string }[] = [
   { key: "seo", label: "SEO" },
   { key: "organization", label: "Vendor & type" },
   { key: "inventory", label: "Inventory" },
+  { key: "identifiers", label: "SKU & barcode" },
+  { key: "weight", label: "Weight" },
 ];
 
 export function newAction(key: ActionMenuKey): EditAction {
@@ -202,6 +266,16 @@ export function newAction(key: ActionMenuKey): EditAction {
       };
     case "inventory":
       return { type: "inventory", field: "policy", value: true };
+    case "identifiers":
+      return {
+        type: "variantText",
+        field: "sku",
+        op: "replace",
+        match: emptyMatch(),
+        value: "",
+      };
+    case "weight":
+      return { type: "weight", op: "set", value: "", unit: "KILOGRAMS" };
   }
 }
 
@@ -229,7 +303,20 @@ export function isActionComplete(action: EditAction): boolean {
       return action.value !== "" || (action.op === "set" && CLEARABLE.has(action.field));
     case "inventory":
       return true;
+    case "variantText":
+      if (action.op === "replace") return action.match.find !== "";
+      // `clear` needs nothing typed; `set` needs something to set.
+      return action.op === "clear" || action.value !== "";
+    case "weight":
+      return action.op === "convert" || parseWeight(action.value) !== null;
   }
+}
+
+/** A weight the merchant typed. Negative is not a weight; zero is (unset). */
+function parseWeight(value: string): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
 /** Text fields where "set to nothing" means "clear it", not "unfinished". */
@@ -242,7 +329,18 @@ const CLEARABLE = new Set<TextTarget>([
 /** Only variant-scoped actions need variants fetched to preview them. */
 export function actionsTouchVariants(actions: EditAction[]): boolean {
   return actions.some(
-    (action) => action.type === "price" || action.type === "inventory",
+    (action) =>
+      action.type === "price" ||
+      action.type === "inventory" ||
+      action.type === "variantText" ||
+      action.type === "weight",
+  );
+}
+
+/** True when any action rewrites SKUs — the duplicate check is only worth it then. */
+export function actionsTouchSku(actions: EditAction[]): boolean {
+  return actions.some(
+    (action) => action.type === "variantText" && action.field === "sku",
   );
 }
 
@@ -274,13 +372,21 @@ export function actionsNeedContent(actions: EditAction[]): boolean {
 }
 
 /**
- * Whether variants have to carry their inventory settings.
+ * Whether variants have to carry their `inventoryItem`.
  *
- * `inventoryItem` is a nested object, so asking for it multiplies the query
- * cost of every variant on every page — see `PREVIEW_PAGE_WITH_INVENTORY`.
+ * It is a nested object — two, once `measurement` comes with it — so asking for
+ * it multiplies the query cost of every variant on every page. See
+ * `PREVIEW_PAGE_WITH_INVENTORY`.
+ *
+ * SKU and barcode are deliberately not in this list: both are plain scalars on
+ * the variant itself, so they are always read and cost nothing. Only the write
+ * side of a SKU goes through `inventoryItem` (`ProductVariantsBulkInput` has no
+ * `sku` field of its own — probed on 2026-07).
  */
 export function actionsNeedInventory(actions: EditAction[]): boolean {
-  return actions.some((action) => action.type === "inventory");
+  return actions.some(
+    (action) => action.type === "inventory" || action.type === "weight",
+  );
 }
 
 // --- serialization ----------------------------------------------------------
@@ -381,6 +487,34 @@ function coerceAction(entry: unknown): EditAction | null {
     };
   }
 
+  if (record.type === "variantText") {
+    const op = VARIANT_TEXT_OPS.includes(record.op as VariantTextOp)
+      ? (record.op as VariantTextOp)
+      : "replace";
+    const field: VariantTextTarget =
+      record.field === "barcode" ? "barcode" : "sku";
+    return {
+      type: "variantText",
+      field,
+      // Only the barcode can be cleared; a `clear` aimed at a SKU degrades to
+      // the harmless op rather than blanking every SKU in the selection.
+      op: op === "clear" && field !== "barcode" ? "replace" : op,
+      match: coerceMatch(record.match),
+      value: typeof record.value === "string" ? record.value : "",
+    };
+  }
+
+  if (record.type === "weight") {
+    return {
+      type: "weight",
+      op: record.op === "convert" ? "convert" : "set",
+      value: typeof record.value === "string" ? record.value : "",
+      unit: (WEIGHT_UNITS as readonly string[]).includes(record.unit as string)
+        ? (record.unit as WeightUnit)
+        : "KILOGRAMS",
+    };
+  }
+
   return null;
 }
 
@@ -407,6 +541,8 @@ const TEXT_TARGETS: TextTarget[] = [
 ];
 
 const TEXT_OPS: TextOp[] = ["replace", "append", "prepend", "set"];
+
+const VARIANT_TEXT_OPS: VariantTextOp[] = ["replace", "set", "clear"];
 
 /** Identity of an action set — used to drop a stale preview when it changes. */
 export function actionsSignature(actions: EditAction[]): string {
@@ -598,6 +734,82 @@ export function nextText(
   }
 }
 
+// --- weight -----------------------------------------------------------------
+
+/** Grams per unit. Exact figures — the pound is defined as 0.45359237 kg. */
+const GRAMS_PER_UNIT: Record<WeightUnit, number> = {
+  KILOGRAMS: 1000,
+  GRAMS: 1,
+  POUNDS: 453.59237,
+  OUNCES: 28.349523125,
+};
+
+export const WEIGHT_UNIT_LABEL: Record<WeightUnit, string> = {
+  KILOGRAMS: "kg",
+  GRAMS: "g",
+  POUNDS: "lb",
+  OUNCES: "oz",
+};
+
+/**
+ * Decimal places kept when converting.
+ *
+ * Enough that kg↔g and lb↔oz stay exact, and that a conversion round-trips
+ * closely enough not to show as a change when nothing was meant to change.
+ * Shopify stores a float, so this is our precision, not theirs.
+ */
+const WEIGHT_PRECISION = 4;
+
+export function convertWeight(weight: Weight, unit: WeightUnit): Weight {
+  if (weight.unit === unit) return weight;
+  const grams = weight.value * GRAMS_PER_UNIT[weight.unit];
+  const converted = grams / GRAMS_PER_UNIT[unit];
+  const factor = 10 ** WEIGHT_PRECISION;
+  return { value: Math.round(converted * factor) / factor, unit };
+}
+
+/**
+ * The new weight, or null to leave it alone.
+ *
+ * A variant with no weight at all is left alone by `convert` — there is nothing
+ * to carry across — and `set` gives it one, which is the only way to put a
+ * weight on a variant that has none.
+ */
+export function nextWeight(
+  current: Weight | null,
+  action: WeightAction,
+): Weight | null {
+  if (action.op === "set") {
+    const value = parseWeight(action.value);
+    return value === null ? null : { value, unit: action.unit };
+  }
+  return current ? convertWeight(current, action.unit) : null;
+}
+
+export function sameWeight(a: Weight | null, b: Weight | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.unit === b.unit && a.value === b.value;
+}
+
+/** "1.2 kg". Trailing zeros trimmed — "500 g", not "500.0000 g". */
+export function formatWeight(weight: Weight | null | undefined): string {
+  if (!weight) return "—";
+  return `${Number(weight.value.toFixed(WEIGHT_PRECISION))} ${
+    WEIGHT_UNIT_LABEL[weight.unit] ?? weight.unit
+  }`;
+}
+
+/** Narrow a value read from Shopify or decoded from a snapshot. */
+export function coerceWeight(value: unknown): Weight | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const amount = Number(record.value);
+  if (!Number.isFinite(amount)) return null;
+  return (WEIGHT_UNITS as readonly string[]).includes(record.unit as string)
+    ? { value: amount, unit: record.unit as WeightUnit }
+    : null;
+}
+
 // --- tags -------------------------------------------------------------------
 
 /** Tag matching is case-insensitive, but the merchant's casing is what sticks. */
@@ -696,9 +908,13 @@ export interface DiffVariant {
   sku: string | null;
   price: string;
   compareAtPrice: string | null;
+  /** Always read — a plain scalar on the variant, so it costs nothing. */
+  barcode?: string | null;
   /** "CONTINUE" | "DENY". Absent unless the scan asked for inventory. */
   inventoryPolicy?: string | null;
   tracked?: boolean | null;
+  /** Absent unless the scan asked for inventory; null when the variant has none. */
+  weight?: Weight | null;
 }
 
 /** The mutable half of a product — what an action stack produces. */
@@ -716,7 +932,13 @@ export type ProductState = Pick<
 
 export type VariantState = Pick<
   DiffVariant,
-  "price" | "compareAtPrice" | "inventoryPolicy" | "tracked"
+  | "sku"
+  | "price"
+  | "compareAtPrice"
+  | "barcode"
+  | "inventoryPolicy"
+  | "tracked"
+  | "weight"
 >;
 
 const PRICE_LABEL: Record<PriceField, string> = {
@@ -885,14 +1107,32 @@ export function nextVariant(
   actions: EditAction[],
 ): VariantState {
   const state: VariantState = {
+    sku: variant.sku,
     price: variant.price,
     compareAtPrice: variant.compareAtPrice,
+    barcode: variant.barcode,
     inventoryPolicy: variant.inventoryPolicy,
     tracked: variant.tracked,
+    weight: variant.weight,
   };
 
   for (const action of actions) {
     if (!isActionComplete(action)) continue;
+
+    if (action.type === "variantText") {
+      applyVariantText(state, action);
+      continue;
+    }
+
+    if (action.type === "weight") {
+      // Undo has no way back from "no weight": Shopify ignores
+      // `measurement: { weight: null }` outright (probed on 2026-07), so a
+      // variant that has none is left alone rather than given one we could not
+      // take away again.
+      if (state.weight === undefined || state.weight === null) continue;
+      state.weight = nextWeight(state.weight, action) ?? state.weight;
+      continue;
+    }
 
     if (action.type === "price") {
       if (action.field === "price") {
@@ -918,6 +1158,37 @@ export function nextVariant(
   }
 
   return state;
+}
+
+/**
+ * SKU and barcode both collapse an empty string to null in Shopify (probed on
+ * 2026-07), so the transform records null and the preview promises exactly what
+ * the catalog will end up holding.
+ */
+function applyVariantText(
+  state: VariantState,
+  action: VariantTextAction,
+): void {
+  const current = state[action.field];
+  if (current === undefined) return;
+
+  let next: string;
+  switch (action.op) {
+    case "replace":
+      next = replaceIn(current ?? "", action.match);
+      break;
+    case "set":
+      next = action.value;
+      break;
+    case "clear":
+      next = "";
+      break;
+  }
+
+  // Trimmed, because Shopify trims: a SKU stored here with a trailing space
+  // would come back without one and every undo would report drift that isn't.
+  const trimmed = next.trim();
+  state[action.field] = trimmed === "" ? null : trimmed;
 }
 
 export function variantDiffs(
@@ -975,8 +1246,72 @@ export function variantDiffs(
       rawAfter: JSON.stringify(next.tracked),
     });
   }
+  // The SKU is written through `inventoryItem`, not the variant input — the
+  // read is on the variant and the write is one level down.
+  if ((variant.sku ?? null) !== (next.sku ?? null)) {
+    diffs.push({
+      fieldPath: "variant.inventoryItem.sku",
+      label: "SKU",
+      before: display(variant.sku ?? null),
+      after: display(next.sku ?? null),
+      rawBefore: JSON.stringify(variant.sku ?? null),
+      rawAfter: JSON.stringify(next.sku ?? null),
+    });
+  }
+  if (
+    variant.barcode !== undefined &&
+    next.barcode !== undefined &&
+    (variant.barcode ?? null) !== (next.barcode ?? null)
+  ) {
+    diffs.push({
+      fieldPath: "variant.barcode",
+      label: "Barcode",
+      before: display(variant.barcode ?? null),
+      after: display(next.barcode ?? null),
+      rawBefore: JSON.stringify(variant.barcode ?? null),
+      rawAfter: JSON.stringify(next.barcode ?? null),
+    });
+  }
+  // One row for both halves. A snapshot that stored the value and the unit
+  // separately could restore 500 with the unit already back to pounds.
+  if (
+    variant.weight !== undefined &&
+    next.weight !== undefined &&
+    !sameWeight(variant.weight ?? null, next.weight ?? null)
+  ) {
+    diffs.push({
+      fieldPath: "variant.inventoryItem.measurement.weight",
+      label: "Weight",
+      before: formatWeight(variant.weight),
+      after: formatWeight(next.weight),
+      rawBefore: JSON.stringify(variant.weight ?? null),
+      rawAfter: JSON.stringify(next.weight ?? null),
+    });
+  }
 
   return diffs;
+}
+
+/**
+ * The SKU every in-scope variant of one product would end up with.
+ *
+ * Shopify allows duplicate SKUs and will not complain, so if a find & replace
+ * collapses two of them into one, nothing but this will notice. Used by the
+ * preview to warn — never to block: duplicates are legal, and a merchant who
+ * means it is entitled to them.
+ */
+export function scopedSkus(
+  product: DiffProduct,
+  actions: EditAction[],
+  variantScope: Set<string> | null,
+): string[] {
+  const skus: string[] = [];
+  for (const variant of product.variants) {
+    if (variantScope && !variantScope.has(variant.id)) continue;
+    const sku = nextVariant(variant, actions).sku;
+    if (sku) skus.push(sku);
+  }
+  return skus;
 }
 
 /**

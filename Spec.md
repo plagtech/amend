@@ -50,6 +50,7 @@ SELECT → EDIT → PREVIEW → APPLY → (UNDO)
    - **Tags:** add / remove / replace
    - **Status:** active / draft / archived (+ schedule both directions = sale windows)
    - **Title / Description:** find & replace (plain match default, case-sensitive toggle, regex behind Advanced toggle); append / prepend
+   - **Inventory quantity is deliberately not editable, in any phase** — see the Phase 5 note in §9. Everything else here restores exactly on undo; a quantity does not.
    - **SEO:** meta title / description find-replace and templating (`{{title}} | {{vendor}}` style tokens)
    - **Inventory:** track/untrack, continue selling when out of stock toggle
    - **Vendor / product type:** set value
@@ -202,10 +203,15 @@ Pricing principle: do not go below $19 — in this category cheap signals fragil
 
 > **Built:** find & replace (plain, case toggle, regex) over title, description, vendor, product type and each tag; append/prepend/set on the same fields; SEO title and description with `{{title}}`/`{{vendor}}`/`{{type}}`/`{{handle}}`/`{{tags}}` templating; inventory tracking and out-of-stock policy; saved templates (list, save from the wizard or a finished job, run pre-fills the wizard, free-plan cap of 3).
 >
-> **Not built, deliberately:**
-> - **SKU / barcode / weight.** Variant identity fields, and weight is a `{value, unit}` pair rather than a scalar — a different shape from everything else the diff table renders. Deferred rather than rushed alongside seven other fields.
-> - **Inventory *quantity* adjustment.** A quantity is owned by fulfilment and moves on its own; an undo that restores yesterday's count over today's sales would be worse than no undo. Track/untrack and the out-of-stock policy are settings, and settings restore cleanly. (Note that untracking makes Shopify discard the stocked quantity — undo restores the setting, not the numbers, and the builder says so.)
-> - **Plan-gating regex and the template cap.** The template allowance is enforced from day one; regex mode is built but ungated until billing lands in Phase 6.
+> **Also built (second pass):** SKU (set + find/replace) and barcode (set + find/replace + clear), both written through `productVariantsBulkUpdate`; weight as a single `{value, unit}` value with set and exact unit conversion. A find/replace that would leave two variants in the selection sharing a SKU raises a warning row in the preview and applies anyway — Shopify allows duplicate SKUs and accepts them without a `userError`, so nothing else would ever mention it.
+>
+> **Not built — excluded by design, not deferred:**
+> - **Inventory *quantity* adjustment.** A quantity is owned by fulfilment and moves on its own; an undo that restores yesterday's count over today's sales would be worse than no undo, so this is out of scope for v1 and beyond rather than waiting on a later phase. Track/untrack and the out-of-stock policy are settings, and settings restore cleanly. (Untracking makes Shopify discard the stocked quantity — undo restores the setting, not the numbers, and the builder says so.)
+> - **Clearing a weight.** Shopify ignores `measurement: { weight: null }` outright, so a variant with no weight is left alone rather than given one that could not be taken back off.
+>
+> **Not built, deferred:** plan-gating for regex. The template allowance is enforced from day one; regex mode is built but ungated until billing lands in Phase 6.
+>
+> **Where the fields actually live (probed on 2026-07, not assumed).** `ProductVariantsBulkInput` has **no** `sku` — the SKU is read from `ProductVariant.sku` but written through `inventoryItem: { sku }`. `barcode` is on the variant input, and Shopify collapses `""` to `null`, so clearing records null and the snapshot preserves the distinction. Weight is read at `inventoryItem.measurement.weight { value unit }` and written as `inventoryItem: { measurement: { weight: { value, unit } } }` — `WeightInput` makes both halves non-null, which is the schema agreeing that it is one value.
 >
 > **Read cost.** Description, SEO and the variant `inventoryItem` are fetched only when an action touches them (`actionsNeedContent` / `actionsNeedInventory`), and the preview scan drops from 25 products per request to 10 when inventory comes along — `inventoryItem` is a nested object, so asking for it on 25×25 nodes lands past Shopify's 1,000-point ceiling and every page of the scan would be rejected. Shopify also rejects an omitted `Boolean!` variable even where the document declares a default for it, so both flags are sent on every request.
 

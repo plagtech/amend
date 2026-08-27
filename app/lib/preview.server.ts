@@ -17,9 +17,12 @@ import type { DiffProduct, EditAction, PreviewRow } from "./actions";
 import {
   actionsNeedContent,
   actionsNeedInventory,
+  actionsTouchSku,
   actionsTouchVariants,
+  coerceWeight,
   isActionComplete,
   previewRowsForProduct,
+  scopedSkus,
 } from "./actions";
 import type { SortKey } from "./catalog";
 import { PREVIEW_PRODUCT_CAP, PREVIEW_ROW_LIMIT } from "./catalog";
@@ -86,7 +89,27 @@ export interface PreviewResult {
    * imply the diff is complete.
    */
   clippedProducts: number;
+  /**
+   * SKUs that more than one selected variant would end up with.
+   *
+   * A warning, never a block: Shopify allows duplicate SKUs and accepts them
+   * without a userError (probed on 2026-07), so a find & replace that collapses
+   * two SKUs into one succeeds silently. A merchant who means it is entitled to
+   * it; one who doesn't should find out here rather than in their inventory
+   * reports a week later.
+   */
+  duplicateSkus: DuplicateSku[];
+  /** Duplicated SKUs in total — `duplicateSkus` lists at most the first ten. */
+  duplicateSkuTotal: number;
 }
+
+export interface DuplicateSku {
+  sku: string;
+  variants: number;
+}
+
+/** Duplicate SKUs listed before the rest are summarised as a count. */
+const DUPLICATE_SKU_LIMIT = 10;
 
 export const EMPTY_PREVIEW: PreviewResult = {
   rows: [],
@@ -97,6 +120,8 @@ export const EMPTY_PREVIEW: PreviewResult = {
   rowsTruncated: false,
   totalRows: 0,
   clippedProducts: 0,
+  duplicateSkus: [],
+  duplicateSkuTotal: 0,
 };
 
 export async function buildPreview(
@@ -142,6 +167,10 @@ export async function buildPreview(
   let productsUnchanged = 0;
   let totalRows = 0;
   let clippedProducts = 0;
+  // Only counted when an action actually rewrites SKUs — otherwise every
+  // preview would pay for a tally nothing reads.
+  const checkSkus = actionsTouchSku(live);
+  const skuCounts = new Map<string, number>();
 
   for (const node of products) {
     const scope = selectionScope(node, filters, selection, variantView);
@@ -149,8 +178,16 @@ export async function buildPreview(
 
     if (includeVariants && variantsWereClipped(node)) clippedProducts += 1;
 
+    const diffProduct = toDiffProduct(node);
+
+    if (checkSkus) {
+      for (const sku of scopedSkus(diffProduct, live, scope.variantIds)) {
+        skuCounts.set(sku, (skuCounts.get(sku) ?? 0) + 1);
+      }
+    }
+
     const produced = previewRowsForProduct(
-      toDiffProduct(node),
+      diffProduct,
       live,
       scope.variantIds,
     );
@@ -177,6 +214,31 @@ export async function buildPreview(
     rowsTruncated: totalRows > rows.length,
     totalRows,
     clippedProducts,
+    ...collectDuplicates(skuCounts),
+  };
+}
+
+/**
+ * The SKUs that end up on more than one variant, worst first.
+ *
+ * Counted across the whole selection rather than the rows on screen: two
+ * variants can collide when only one of them changed, and the one that did not
+ * change has no row here to notice it on.
+ */
+function collectDuplicates(counts: Map<string, number>): {
+  duplicateSkus: DuplicateSku[];
+  duplicateSkuTotal: number;
+} {
+  const duplicates: DuplicateSku[] = [];
+  for (const [sku, variants] of counts) {
+    if (variants > 1) duplicates.push({ sku, variants });
+  }
+  duplicates.sort(
+    (a, b) => b.variants - a.variants || a.sku.localeCompare(b.sku),
+  );
+  return {
+    duplicateSkus: duplicates.slice(0, DUPLICATE_SKU_LIMIT),
+    duplicateSkuTotal: duplicates.length,
   };
 }
 
@@ -252,11 +314,16 @@ function toDiffProduct(node: ProductNode): DiffProduct {
       sku: variant.sku,
       price: variant.price,
       compareAtPrice: variant.compareAtPrice,
+      barcode: variant.barcode,
       inventoryPolicy: variant.inventoryPolicy,
       tracked:
         variant.inventoryItem === undefined
           ? undefined
           : (variant.inventoryItem?.tracked ?? null),
+      weight:
+        variant.inventoryItem === undefined
+          ? undefined
+          : coerceWeight(variant.inventoryItem?.measurement?.weight),
     })),
   };
 }

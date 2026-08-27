@@ -57,13 +57,20 @@ export interface VariantRow {
   price: string;
   compareAtPrice: string | null;
   inventoryQuantity: number | null;
+  /** A scalar on the variant, so it rides along with every variant read. */
+  barcode?: string | null;
   /**
    * Inventory settings, fetched only when an action edits them (see
    * `actionsNeedInventory`). Absent — not null — when they were not read, which
    * is what stops a diff being computed against a value nobody looked at.
    */
   inventoryPolicy?: string;
-  inventoryItem?: { tracked: boolean | null } | null;
+  inventoryItem?: {
+    tracked: boolean | null;
+    measurement: {
+      weight: { value: number; unit: string } | null;
+    } | null;
+  } | null;
 }
 
 export interface ProductRow {

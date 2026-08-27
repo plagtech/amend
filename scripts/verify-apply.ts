@@ -29,7 +29,14 @@ import type { EditJob } from "@prisma/client";
 
 import db from "../app/db.server";
 import type { EditAction } from "../app/lib/actions";
-import { emptyMatch, nextProduct, nextVariant } from "../app/lib/actions";
+import type { Weight } from "../app/lib/actions";
+import {
+  coerceWeight,
+  emptyMatch,
+  formatWeight,
+  nextProduct,
+  nextVariant,
+} from "../app/lib/actions";
 import type { ProductStatus } from "../app/lib/filters";
 import {
   createApplyJob,
@@ -83,6 +90,14 @@ const BULK_POLL_MS = 5_000;
  *                template that reads the running title — and set over a field
  *                that starts null, so undo has to put a null back
  *   policy       an enum on the variant input, the inventory shape
+ *   SKU          a find & replace written through `inventoryItem`, matching
+ *                only one variant per product — so per-variant no-op
+ *                suppression is proven, not assumed
+ *   barcode      cleared to null. Shopify collapses "" to null, so if this
+ *                wrote "" the undo would read drift on every row and the
+ *                "nothing had drifted" check below would fail
+ *   weight       a composite `{value, unit}` written as one value, with the
+ *                unit changing too (0 lb → 1.2 kg)
  *
  * `tracked` is deliberately not exercised against the store: untracking a
  * variant makes Shopify discard its stocked quantity, and the seed store's
@@ -119,13 +134,33 @@ const EDIT: EditAction[] = [
     value: "{{title}} | {{vendor}}",
   },
   { type: "inventory", field: "policy", value: true },
+  {
+    type: "variantText",
+    field: "sku",
+    op: "replace",
+    // Only the "-S" variant of each product matches, and the SKU prefix the
+    // filter selects on is left intact — so nothing that re-resolves this
+    // selection mid-run can see a different set of products than it started on.
+    match: {
+      find: "-S",
+      replaceWith: "-SM",
+      caseSensitive: true,
+      regex: false,
+    },
+    value: "",
+  },
+  { type: "variantText", field: "barcode", op: "clear", match: emptyMatch(), value: "" },
+  { type: "weight", op: "set", value: "1.2", unit: "KILOGRAMS" },
 ];
 
 /** Product-level rows one selected product produces (tags, title, SEO title). */
 const PRODUCT_ROWS_PER_PRODUCT = 3;
 
-/** Variant-level rows one selected variant produces (price, policy). */
-const VARIANT_ROWS_PER_VARIANT = 2;
+/** Rows every selected variant produces (price, policy, barcode, weight). */
+const VARIANT_ROWS_PER_VARIANT = 4;
+
+/** Rows the SKU replace produces per product — it matches the "-S" variant only. */
+const SKU_ROWS_PER_PRODUCT = 1;
 
 /** Variants the seed gives every product — asserted before it is relied on. */
 const SEED_VARIANTS_PER_PRODUCT = 3;
@@ -202,6 +237,9 @@ interface StoreVariant {
   price: string;
   compareAtPrice: string | null;
   inventoryPolicy: string;
+  sku: string | null;
+  barcode: string | null;
+  weight: Weight | null;
 }
 
 interface StoreProduct {
@@ -232,6 +270,16 @@ const STATE_QUERY = `#graphql
             price
             compareAtPrice
             inventoryPolicy
+            sku
+            barcode
+            inventoryItem {
+              measurement {
+                weight {
+                  value
+                  unit
+                }
+              }
+            }
           }
         }
       }
@@ -267,7 +315,13 @@ async function readStore(
           title: string;
           vendor: string;
           seo: { title: string | null } | null;
-          variants: { nodes: StoreVariant[] };
+          variants: {
+            nodes: (Omit<StoreVariant, "weight"> & {
+              inventoryItem: {
+                measurement: { weight: { value: number; unit: string } | null };
+              };
+            })[];
+          };
         } | null)[];
       };
       errors?: { message: string }[];
@@ -302,6 +356,12 @@ async function readStore(
                 ? null
                 : money(variant.compareAtPrice),
             inventoryPolicy: variant.inventoryPolicy,
+            sku: variant.sku,
+            // Read as-is. A barcode Shopify holds as unset must not be
+            // flattened to "" here, or the assertion that undo restores it
+            // would pass on a store that no longer matches.
+            barcode: variant.barcode,
+            weight: coerceWeight(variant.inventoryItem.measurement.weight),
           }))
           .sort((a, b) => a.id.localeCompare(b.id)),
       });
@@ -309,6 +369,17 @@ async function readStore(
   }
 
   return state;
+}
+
+/**
+ * True when a variant already carries the weight this edit sets.
+ *
+ * Asserted false before the run: a variant that is already 1.2 kg would produce
+ * no weight row, and the row constants above would be wrong without anything
+ * saying so.
+ */
+function sameSetWeight(weight: Weight | null): boolean {
+  return weight?.value === 1.2 && weight.unit === "KILOGRAMS";
 }
 
 function money(value: string): string {
@@ -380,10 +451,12 @@ function expectedAfterApply(
           {
             id: variant.id,
             title: "",
-            sku: null,
+            sku: variant.sku,
             price: variant.price,
             compareAtPrice: variant.compareAtPrice,
+            barcode: variant.barcode,
             inventoryPolicy: variant.inventoryPolicy,
+            weight: variant.weight,
           },
           EDIT,
         );
@@ -393,6 +466,9 @@ function expectedAfterApply(
           compareAtPrice: nextVariantState.compareAtPrice,
           inventoryPolicy:
             nextVariantState.inventoryPolicy ?? variant.inventoryPolicy,
+          sku: nextVariantState.sku ?? null,
+          barcode: nextVariantState.barcode ?? null,
+          weight: nextVariantState.weight ?? null,
         };
       }),
     });
@@ -520,7 +596,16 @@ async function main(): Promise<void> {
           product.seoTitle === null &&
           !product.tags.includes(VERIFY_TAG) &&
           product.variants.length === SEED_VARIANTS_PER_PRODUCT &&
-          product.variants.every((v) => v.inventoryPolicy === "DENY")
+          product.variants.every((v) => v.inventoryPolicy === "DENY") &&
+          // One SKU per product ends in "-S", so the SKU replace produces
+          // exactly one row per product and two variants prove no-op
+          // suppression by producing none.
+          product.variants.filter((v) => v.sku?.endsWith("-S")).length ===
+            SKU_ROWS_PER_PRODUCT &&
+          product.variants.every((v) => Boolean(v.barcode)) &&
+          product.variants.every(
+            (v) => v.weight !== null && !sameSetWeight(v.weight),
+          )
         );
       }),
     );
@@ -620,11 +705,13 @@ async function main(): Promise<void> {
     const applied = await runToCompletion(admin, job.id);
 
     const rows = await db.snapshot.findMany({ where: { jobId: job.id } });
-    // Two rows per variant (price, out-of-stock policy) for every selected
-    // product, plus three product rows (tags, title, SEO title) for every one
-    // except the product whose product-level row was excluded.
+    // Four rows per variant (price, policy, barcode, weight) for every selected
+    // product, one SKU row per product (only its "-S" variant matches), plus
+    // three product rows (tags, title, SEO title) for every product except the
+    // one whose product-level row was excluded.
     const expectedRows =
       selectedIds.length * SEED_VARIANTS_PER_PRODUCT * VARIANT_ROWS_PER_VARIANT +
+      selectedIds.length * SKU_ROWS_PER_PRODUCT +
       (selectedIds.length - 1) * PRODUCT_ROWS_PER_PRODUCT;
 
     check("job completed", applied.status, "completed");
@@ -699,6 +786,48 @@ async function main(): Promise<void> {
           .get(id)!
           .variants.every((variant) => variant.inventoryPolicy === "CONTINUE"),
       ),
+    );
+    check(
+      "the SKU replace hit only the variant it matched",
+      selectedIds.flatMap((id) =>
+        afterApply
+          .get(id)!
+          .variants.filter(
+            (variant, i) => variant.sku !== before.get(id)!.variants[i].sku,
+          ),
+      ).length,
+      selectedIds.length * SKU_ROWS_PER_PRODUCT,
+    );
+    assertTrue(
+      "the rewritten SKUs read as expected",
+      selectedIds.every((id) =>
+        afterApply
+          .get(id)!
+          .variants.every(
+            (variant, i) =>
+              variant.sku ===
+              (before.get(id)!.variants[i].sku!.endsWith("-S")
+                ? `${before.get(id)!.variants[i].sku!.slice(0, -2)}-SM`
+                : before.get(id)!.variants[i].sku),
+          ),
+      ),
+    );
+    // Shopify collapses "" to null on write, so a clear that wrote "" would
+    // read back as null here and pass — but the undo below would then compare a
+    // live null against a snapshot's "" and flag drift on every row. Between
+    // the two checks, only a true null passes both.
+    assertTrue(
+      "every barcode is now unset, not blank",
+      selectedIds.every((id) =>
+        afterApply.get(id)!.variants.every((variant) => variant.barcode === null),
+      ),
+    );
+    check(
+      "weight moved as one value, unit included",
+      afterApply.get(selectedIds[0])!.variants.map((v) => formatWeight(v.weight)),
+      before
+        .get(selectedIds[0])!
+        .variants.map(() => formatWeight({ value: 1.2, unit: "KILOGRAMS" })),
     );
     check(
       "unselected products in the same filter were untouched",
@@ -799,6 +928,20 @@ async function main(): Promise<void> {
     assertTrue(
       "an SEO title that was never set is unset again, not blank",
       selectedIds.every((id) => afterUndo.get(id)!.seoTitle === null),
+    );
+    assertTrue(
+      "every cleared barcode came back, and the weights came back whole",
+      selectedIds.every((id) =>
+        afterUndo
+          .get(id)!
+          .variants.every(
+            (variant, i) =>
+              variant.barcode === before.get(id)!.variants[i].barcode &&
+              variant.barcode !== null &&
+              formatWeight(variant.weight) ===
+                formatWeight(before.get(id)!.variants[i].weight),
+          ),
+      ),
     );
   } finally {
     // The catalog restores itself via undo; the job rows are this script's

@@ -115,9 +115,16 @@ const PRODUCT_PAGE_QUERY = `#graphql
             price
             compareAtPrice
             inventoryQuantity
+            barcode
             inventoryPolicy @include(if: $includeInventory)
             inventoryItem @include(if: $includeInventory) {
               tracked
+              measurement {
+                weight {
+                  value
+                  unit
+                }
+              }
             }
           }
         }

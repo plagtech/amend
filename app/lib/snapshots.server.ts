@@ -196,9 +196,17 @@ const CURRENT_VALUES_QUERY = `#graphql
         id
         price
         compareAtPrice
+        barcode
         inventoryPolicy
         inventoryItem {
+          sku
           tracked
+          measurement {
+            weight {
+              value
+              unit
+            }
+          }
         }
         product {
           id
@@ -306,9 +314,14 @@ async function fetchCurrentValues(
           values: {
             "variant.price": node.price,
             "variant.compareAtPrice": node.compareAtPrice,
+            "variant.barcode": node.barcode ?? null,
             "variant.inventoryPolicy": node.inventoryPolicy,
+            "variant.inventoryItem.sku": node.inventoryItem?.sku ?? null,
             "variant.inventoryItem.tracked":
               node.inventoryItem?.tracked ?? null,
+            // Read and restored as one value — see `WeightAction`.
+            "variant.inventoryItem.measurement.weight":
+              node.inventoryItem?.measurement?.weight ?? null,
           },
         });
       }
@@ -330,8 +343,13 @@ interface LiveNode {
   seo?: { title: string | null; description: string | null } | null;
   price?: string;
   compareAtPrice?: string | null;
+  barcode?: string | null;
   inventoryPolicy?: string;
-  inventoryItem?: { tracked: boolean | null } | null;
+  inventoryItem?: {
+    sku: string | null;
+    tracked: boolean | null;
+    measurement: { weight: { value: number; unit: string } | null } | null;
+  } | null;
   product?: { id: string } | null;
 }
 
@@ -356,6 +374,14 @@ function sameEncoded(a: string, b: string): boolean {
     return false;
   }
 
+  // A composite value — a weight's `{value, unit}` — is one field, and the two
+  // sides of this comparison are built by different code (one from Shopify's
+  // response, one from what we wrote). Comparing them key-order-independently
+  // is what stops every weight undo reporting drift it did not have.
+  if (isPlainObject(left) && isPlainObject(right)) {
+    return canonical(left) === canonical(right);
+  }
+
   if (Array.isArray(left) && Array.isArray(right)) {
     if (left.length !== right.length) return false;
     const sortedLeft = [...left].map(String).sort();
@@ -375,6 +401,20 @@ function sameEncoded(a: string, b: string): boolean {
   }
 
   return false;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function canonical(value: Record<string, unknown>): string {
+  return JSON.stringify(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, value[key]]),
+  );
 }
 
 // --- labels -----------------------------------------------------------------

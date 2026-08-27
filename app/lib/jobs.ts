@@ -8,6 +8,7 @@
  */
 
 import type { EditAction } from "./actions";
+import { WEIGHT_UNIT_LABEL } from "./actions";
 
 /**
  * A job's lifecycle.
@@ -182,6 +183,19 @@ export function describeActions(actions: EditAction[]): string {
         return action.value
           ? "continue selling when out of stock"
           : "stop selling when out of stock";
+      case "variantText": {
+        const field = action.field === "sku" ? "SKU" : "barcode";
+        if (action.op === "replace") {
+          return `${field} "${action.match.find}" → "${action.match.replaceWith}"`;
+        }
+        return action.op === "clear"
+          ? `clear ${field}`
+          : `${field} → ${action.value}`;
+      }
+      case "weight":
+        return action.op === "convert"
+          ? `weight in ${WEIGHT_UNIT_LABEL[action.unit]}`
+          : `weight → ${action.value || "0"} ${WEIGHT_UNIT_LABEL[action.unit]}`;
       default:
         return "edit";
     }
@@ -219,6 +233,12 @@ export function fieldLabel(fieldPath: string): string {
       return "When out of stock";
     case "variant.inventoryItem.tracked":
       return "Track quantity";
+    case "variant.inventoryItem.sku":
+      return "SKU";
+    case "variant.barcode":
+      return "Barcode";
+    case "variant.inventoryItem.measurement.weight":
+      return "Weight";
     case "product.tags":
       return "Tags";
     case "product.status":

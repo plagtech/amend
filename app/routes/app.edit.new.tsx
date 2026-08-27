@@ -63,6 +63,8 @@ import type {
 import {
   ACTION_TYPES,
   TOKEN_HELP,
+  WEIGHT_UNITS,
+  WEIGHT_UNIT_LABEL,
   actionsSignature,
   isActionComplete,
   newAction,
@@ -1377,6 +1379,10 @@ function ActionEditor({
           <TextFields action={action} onChange={onChange} />
         ) : action.type === "inventory" ? (
           <InventoryFields action={action} onChange={onChange} />
+        ) : action.type === "variantText" ? (
+          <VariantTextFields action={action} onChange={onChange} />
+        ) : action.type === "weight" ? (
+          <WeightFields action={action} onChange={onChange} />
         ) : (
           <StatusFields action={action} onChange={onChange} />
         )}
@@ -1743,6 +1749,137 @@ function InventoryFields({
   );
 }
 
+/**
+ * SKU and barcode.
+ *
+ * No `{{token}}` help text here, unlike the product text fields: a token
+ * expands from the product, so templating a SKU would give every variant of a
+ * product the same one. Find & replace is the flagship case anyway — reformatting
+ * a prefix across a catalog.
+ */
+function VariantTextFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "variantText" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  const isBarcode = action.field === "barcode";
+
+  return (
+    <BlockStack gap="200">
+      <InlineStack gap="300" blockAlign="end" wrap>
+        <Select
+          label="Field"
+          options={[
+            { label: "SKU", value: "sku" },
+            { label: "Barcode", value: "barcode" },
+          ]}
+          value={action.field}
+          onChange={(field) =>
+            onChange({
+              ...action,
+              field: field as typeof action.field,
+              // Only a barcode can be cleared, so switching to SKU has to take
+              // the op with it rather than leave an impossible combination.
+              op: field === "sku" && action.op === "clear" ? "replace" : action.op,
+            })
+          }
+        />
+        <Select
+          label="Change"
+          options={[
+            { label: "Find & replace", value: "replace" },
+            { label: "Set to", value: "set" },
+            ...(isBarcode ? [{ label: "Clear", value: "clear" }] : []),
+          ]}
+          value={action.op}
+          onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
+        />
+        {action.op === "replace" ? (
+          <MatchFields
+            match={action.match}
+            onChange={(match) => onChange({ ...action, match })}
+          />
+        ) : action.op === "set" ? (
+          <TextField
+            label="New value"
+            value={action.value}
+            onChange={(value) => onChange({ ...action, value })}
+            autoComplete="off"
+          />
+        ) : null}
+      </InlineStack>
+      {action.field === "sku" ? (
+        <Text as="p" variant="bodySm" tone="subdued">
+          Shopify allows two variants to share a SKU, so nothing here will stop
+          you — the preview says so if this edit would produce duplicates.
+        </Text>
+      ) : null}
+    </BlockStack>
+  );
+}
+
+/**
+ * Weight: value and unit as one control, because they are one value.
+ *
+ * Conversion is exact — 1.2 kg becomes 1200 g, not 1200.0001 — and leaves the
+ * physical weight alone, which is the difference between "the catalog is in
+ * grams now" and "everything got heavier".
+ */
+function WeightFields({
+  action,
+  onChange,
+}: {
+  action: Extract<EditAction, { type: "weight" }>;
+  onChange: (action: EditAction) => void;
+}) {
+  return (
+    <BlockStack gap="200">
+      <InlineStack gap="300" blockAlign="end" wrap>
+        <Select
+          label="Weight"
+          options={[
+            { label: "Set to", value: "set" },
+            { label: "Convert to", value: "convert" },
+          ]}
+          value={action.op}
+          onChange={(op) => onChange({ ...action, op: op as typeof action.op })}
+        />
+        {action.op === "set" ? (
+          <Box maxWidth="120px">
+            <TextField
+              label="Value"
+              type="number"
+              min={0}
+              step={0.01}
+              value={action.value}
+              onChange={(value) => onChange({ ...action, value })}
+              autoComplete="off"
+            />
+          </Box>
+        ) : null}
+        <Select
+          label="Unit"
+          options={WEIGHT_UNITS.map((unit) => ({
+            label: WEIGHT_UNIT_LABEL[unit],
+            value: unit,
+          }))}
+          value={action.unit}
+          onChange={(unit) =>
+            onChange({ ...action, unit: unit as typeof action.unit })
+          }
+        />
+      </InlineStack>
+      <Text as="p" variant="bodySm" tone="subdued">
+        {action.op === "convert"
+          ? "Keeps each variant's actual weight and restates it in this unit."
+          : "Variants that have no weight at all are left alone — Shopify offers no way to take one back off, so undo could not reverse it."}
+      </Text>
+    </BlockStack>
+  );
+}
+
 // --- preview ----------------------------------------------------------------
 
 function PreviewSection({
@@ -1945,6 +2082,36 @@ function PreviewBody({
             more variants than a single preview query returns, so not every
             variant is listed below.
           </p>
+        </Banner>
+      ) : null}
+
+      {/* A warning, not a block: Shopify allows duplicate SKUs, so a merchant
+          who means it can go ahead — but nothing else in the system will ever
+          mention it. */}
+      {preview.duplicateSkuTotal ? (
+        <Banner tone="warning" title="This edit would repeat SKUs">
+          <p>
+            {preview.duplicateSkuTotal.toLocaleString()}{" "}
+            {preview.duplicateSkuTotal === 1 ? "SKU" : "SKUs"} would end up on
+            more than one variant in this selection. Shopify allows that, and
+            this edit will still apply.
+          </p>
+          <List>
+            {preview.duplicateSkus.map((duplicate) => (
+              <List.Item key={duplicate.sku}>
+                <strong>{duplicate.sku}</strong> — {duplicate.variants} variants
+              </List.Item>
+            ))}
+          </List>
+          {preview.duplicateSkuTotal > preview.duplicateSkus.length ? (
+            <p>
+              …and{" "}
+              {(
+                preview.duplicateSkuTotal - preview.duplicateSkus.length
+              ).toLocaleString()}{" "}
+              more.
+            </p>
+          ) : null}
         </Banner>
       ) : null}
 
