@@ -1,12 +1,13 @@
 {
-  "name": "app",
+  "name": "amend",
+  "author": "Plagtech",
   "private": true,
   "scripts": {
     "build": "remix vite:build",
-    "dev": "shopify app dev",
+    "dev": "shopify app dev --config dev",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
-    "deploy": "shopify app deploy",
+    "deploy": "shopify app deploy --config shopify.app.toml",
     "config:use": "shopify app config use",
     "env": "shopify app env",
     "start": "remix-serve ./build/server/index.js",
@@ -22,6 +23,8 @@
     "vite": "vite",
     "verify:apply": "tsx scripts/verify-apply.ts",
     "verify:plan": "tsx scripts/verify-plan.ts",
+    "verify:retention": "tsx scripts/verify-retention.ts",
+    "verify:refusal": "tsx scripts/verify-apply.ts --refuse=first && tsx scripts/verify-apply.ts --refuse=later && tsx scripts/verify-apply.ts --refuse=undo",
     "verify:schedule": "tsx scripts/verify-schedule.ts",
     "verify:billing": "tsx scripts/verify-billing.ts",
     "verify:deploy": "tsx scripts/verify-deploy.ts"

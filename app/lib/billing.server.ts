@@ -37,6 +37,8 @@
  * a sync whenever the settings page is opened.
  */
 
+import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
+
 import db from "../db.server";
 import type { EditAction } from "./actions";
 
@@ -46,6 +48,108 @@ export const PRO_PLAN = "Amend Pro";
 export const PRO_PRICE = 19;
 export const PRO_CURRENCY = "USD";
 export const PRO_TRIAL_DAYS = 7;
+
+/** Where a merchant lands after approving or declining the charge. */
+export const BILLING_RETURN_PATH = "/app/settings?upgraded=1";
+
+/**
+ * The `returnUrl` for a subscription: the app's page inside the Shopify admin,
+ * `https://admin.shopify.com/store/<store>/apps/<client_id><path>`.
+ *
+ * Not `${SHOPIFY_APP_URL}<path>`. Shopify sends the merchant back top-level,
+ * outside the admin iframe, carrying only `charge_id` — no `shop`, no `host`,
+ * no session token — so `authenticate.admin` on the app's own host can only
+ * bounce them to `/auth/login`. And `SHOPIFY_APP_URL` is a dev tunnel that
+ * changes on every `shopify app dev`, or is blank where nothing injected it.
+ * The admin URL is built from the shop and the app's client id alone, so it
+ * has no host to go stale: the admin loads the app embedded, with `shop` and
+ * `host` and a fresh session token, at `<path>`. It is the same shape
+ * `shopify-api` builds when no `returnUrl` is given (`billing/request.mjs`),
+ * plus the path.
+ *
+ * In production `apiKey` is the production app's client id (`SHOPIFY_API_KEY`
+ * on Railway), so the return lands on the production app — see DEPLOY.md.
+ */
+export function billingReturnUrl(
+  shopDomain: string,
+  apiKey: string,
+  path: string = BILLING_RETURN_PATH,
+): string {
+  if (!apiKey) {
+    throw new Error(
+      "No client id to build the billing return URL from (SHOPIFY_API_KEY is empty).",
+    );
+  }
+  const store = shopDomain.replace(/\.myshopify\.com$/, "");
+  return `https://admin.shopify.com/store/${store}/apps/${apiKey}${path}`;
+}
+
+/**
+ * Whether Shopify considers this shop a development store — the documented
+ * check (`shop.plan.partnerDevelopment`, "Offer free trials with the Billing
+ * API"). Verified live on the seed store: `true`.
+ *
+ * Takes a bare `query` function rather than an admin context so the route
+ * (`admin.graphql`) and `verify-billing.ts` (a raw token) share it.
+ */
+export const DEV_STORE_QUERY = `#graphql
+  query AmendShopPlan {
+    shop {
+      plan {
+        partnerDevelopment
+      }
+    }
+  }
+`;
+
+export type ShopPlanQuery = (
+  query: string,
+) => Promise<{ shop: { plan: { partnerDevelopment: boolean } } }>;
+
+export async function isDevelopmentStore(run: ShopPlanQuery): Promise<boolean> {
+  const data = await run(DEV_STORE_QUERY);
+  return data.shop.plan.partnerDevelopment === true;
+}
+
+/** `isDevelopmentStore` through the app's own admin client. */
+export function shopPlanQueryFor(admin: AdminApiContext): ShopPlanQuery {
+  return async (query) => {
+    const response = await admin.graphql(query);
+    const body = (await response.json()) as {
+      data?: { shop: { plan: { partnerDevelopment: boolean } } };
+    };
+    if (!body.data) throw new Error("Shopify returned no shop plan");
+    return body.data;
+  };
+}
+
+/**
+ * Whether a charge for this shop is created with `test: true`.
+ *
+ * Decided per request at runtime, never at build time. True for:
+ *
+ *   - **a development store**, on any deploy. Shopify's docs tell manual-
+ *     pricing apps to use test charges there, and App Store reviewers install
+ *     on development stores — under production that used to request a real
+ *     charge, because nothing here recognised one. A development store cannot
+ *     become a paying store, so this never lets a real merchant off a bill.
+ *   - `BILLING_TEST=1`, an explicit override for staging.
+ *   - `NODE_ENV` other than `production` (local `shopify app dev`).
+ *
+ * The loader and the action must agree: `billing.check({ isTest: false })`
+ * ignores test subscriptions (shopify-api `billing/check.mjs`), so a dev store
+ * judged differently on the two paths would buy Pro and never see it.
+ */
+export function testChargesFor(input: {
+  developmentStore: boolean;
+  env: { BILLING_TEST?: string; NODE_ENV?: string };
+}): boolean {
+  return (
+    input.developmentStore ||
+    input.env.BILLING_TEST === "1" ||
+    input.env.NODE_ENV !== "production"
+  );
+}
 
 export type Plan = "free" | "pro";
 

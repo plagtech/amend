@@ -22,6 +22,8 @@ import { createApplyJob, createUndoJob } from "../app/lib/apply.server";
 import {
   PlanLimitError,
   assertActionsAllowed,
+  isDevelopmentStore,
+  testChargesFor,
   usableTemplateIds,
 } from "../app/lib/billing.server";
 import { emptyFilters } from "../app/lib/filters";
@@ -314,6 +316,58 @@ async function main(): Promise<void> {
         ),
       ],
       ["a", "b", "c"],
+    );
+
+    // --- test charges ------------------------------------------------------
+    // The rule that decides `isTest` on the billing page, as the route calls
+    // it. The production rows are the ones that matter: a deploy with
+    // NODE_ENV=production and BILLING_TEST unset.
+    console.log("\nTest charges — who gets one:");
+    const PROD = { NODE_ENV: "production" };
+    check(
+      "a development store under production gets a test charge",
+      testChargesFor({ developmentStore: true, env: PROD }),
+      true,
+    );
+    check(
+      "a real store under production is billed for real",
+      testChargesFor({ developmentStore: false, env: PROD }),
+      false,
+    );
+    check(
+      "BILLING_TEST=1 forces a test charge on a real store",
+      testChargesFor({
+        developmentStore: false,
+        env: { ...PROD, BILLING_TEST: "1" },
+      }),
+      true,
+    );
+    check(
+      "BILLING_TEST set to anything else does not",
+      testChargesFor({
+        developmentStore: false,
+        env: { ...PROD, BILLING_TEST: "0" },
+      }),
+      false,
+    );
+    check(
+      "local development always uses test charges",
+      testChargesFor({ developmentStore: false, env: { NODE_ENV: "development" } }),
+      true,
+    );
+    check(
+      "the shop-plan answer is read from partnerDevelopment",
+      await isDevelopmentStore(async () => ({
+        shop: { plan: { partnerDevelopment: true } },
+      })),
+      true,
+    );
+    check(
+      "and a paid store's answer is false",
+      await isDevelopmentStore(async () => ({
+        shop: { plan: { partnerDevelopment: false } },
+      })),
+      false,
     );
   } finally {
     await reset();

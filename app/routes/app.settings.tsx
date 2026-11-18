@@ -25,6 +25,7 @@ import {
   Text,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
+import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
@@ -33,34 +34,31 @@ import {
   PRO_PLAN,
   PRO_PRICE,
   PRO_TRIAL_DAYS,
+  billingReturnUrl,
+  isDevelopmentStore,
+  shopPlanQueryFor,
   syncPlan,
+  testChargesFor,
 } from "../lib/billing.server";
 import {
   CYCLE_DAYS,
   FREE_JOB_LIMIT,
   FREE_TEMPLATE_LIMIT,
+  SNAPSHOT_RETENTION_DAYS,
 } from "../lib/jobs";
 
-/**
- * Test charges on a development store.
- *
- * Shopify refuses real charges on a dev store anyway, so this is not a
- * shortcut — it is the only way the flow can be exercised before launch. It
- * follows the store, not a build flag, so a production store is always billed
- * for real even if this ships with the wrong NODE_ENV.
- */
-function useTestCharges(shopDomain: string): boolean {
-  return (
-    process.env.BILLING_TEST === "1" ||
-    shopDomain.endsWith(".myshopify.io") ||
-    process.env.NODE_ENV !== "production"
-  );
+/** Test charges for this shop — see `testChargesFor` for the rule. */
+async function testChargesForShop(admin: AdminApiContext): Promise<boolean> {
+  return testChargesFor({
+    developmentStore: await isDevelopmentStore(shopPlanQueryFor(admin)),
+    env: process.env,
+  });
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { billing, session } = await authenticate.admin(request);
+  const { admin, billing, session } = await authenticate.admin(request);
   const shopId = session.shop;
-  const isTest = useTestCharges(shopId);
+  const isTest = await testChargesForShop(admin);
 
   const check = await billing.check({ isTest }).catch(() => null);
   const state = await syncPlan(shopId, check?.appSubscriptions ?? []);
@@ -88,20 +86,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { billing, session } = await authenticate.admin(request);
+  const { admin, billing, session } = await authenticate.admin(request);
   const shopId = session.shop;
-  const isTest = useTestCharges(shopId);
+  const isTest = await testChargesForShop(admin);
   const form = await request.formData();
   const intent = form.get("intent");
 
   if (intent === "subscribe") {
     // Throws a redirect to Shopify's confirmation page. The merchant approves
-    // there, and Shopify returns them to `returnUrl` — where the loader above
-    // syncs `Shop.plan` from what Shopify now reports.
+    // there, and Shopify returns them to `returnUrl` — this page, embedded in
+    // the admin (see `billingReturnUrl`), where the loader above syncs
+    // `Shop.plan` from what Shopify now reports.
     await billing.request({
       plan: PRO_PLAN,
       isTest,
-      returnUrl: `${process.env.SHOPIFY_APP_URL}/app/settings?upgraded=1`,
+      returnUrl: billingReturnUrl(shopId, process.env.SHOPIFY_API_KEY ?? ""),
     });
   }
 
@@ -265,7 +264,13 @@ export default function Settings() {
                 <Text as="p" variant="bodyMd">
                   Every edit stores its before-values, and undo is free on every
                   plan — including after a downgrade. Snapshots are kept for{" "}
-                  <strong>{pro ? "365 days" : "90 days"}</strong>.
+                  <strong>
+                    {pro
+                      ? SNAPSHOT_RETENTION_DAYS.pro
+                      : SNAPSHOT_RETENTION_DAYS.free}{" "}
+                    days
+                  </strong>{" "}
+                  after the edit; after that, undo for it expires.
                 </Text>
                 <Box paddingBlockStart="200">
                   <Text as="p" variant="bodySm" tone="subdued">

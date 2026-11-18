@@ -15,7 +15,39 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 
 import type { MutationStage, MutationUnit } from "./mutations";
 import { STAGE_MUTATION } from "./mutations";
-import { ThrottledAdmin } from "./throttle.server";
+import { ShopifyResponseError, ThrottledAdmin } from "./throttle.server";
+
+/**
+ * A bulk stage that **certainly did not start**: staging the upload failed, or
+ * Shopify answered `bulkOperationRunMutation` with a refusal — a `userError`
+ * or a GraphQL error such as access denied (bulk mutations must be enabled per
+ * app, and lapse after 31 days unused). Nothing of this stage was written, so
+ * the engine may apply its rows another way without applying anything twice.
+ *
+ * A transport failure on the run call itself is *not* this: the request may
+ * have reached Shopify and started an operation, so it surfaces as a plain
+ * Error and the job does not fall back.
+ */
+export class BulkStartRefused extends Error {
+  constructor(
+    message: string,
+    readonly stage: MutationStage,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Test hook: return a message to have `startBulkStage` refuse that stage
+ * exactly as Shopify would, or null to let it through. Only
+ * `scripts/verify-apply.ts --refuse=…` sets it; nothing in `app/` does.
+ */
+type RefusalHook = (stage: MutationStage) => string | null;
+let refusalHook: RefusalHook | null = null;
+
+export function setBulkRefusalForTesting(hook: RefusalHook | null): void {
+  refusalHook = hook;
+}
 
 const STAGED_UPLOAD_MUTATION = `#graphql
   mutation AmendStagedUpload($input: [StagedUploadInput!]!) {
@@ -98,6 +130,57 @@ export async function startBulkStage(
   units: MutationUnit[],
 ): Promise<string> {
   const client = new ThrottledAdmin(admin);
+  const key = await stageUpload(client, stage, units).catch((error: unknown) => {
+    // The run mutation has not been sent, so no operation can exist.
+    throw new BulkStartRefused(
+      `Could not stage the bulk upload: ${(error as Error).message}`,
+      stage,
+    );
+  });
+
+  const forced = refusalHook?.(stage) ?? null;
+  if (forced) throw new BulkStartRefused(forced, stage);
+
+  let run: {
+    bulkOperationRunMutation: {
+      bulkOperation: { id: string; status: string } | null;
+      userErrors: { field: string[] | null; message: string; code: string | null }[];
+    };
+  };
+  try {
+    run = await client.run(
+      RUN_MUTATION,
+      { mutation: STAGE_MUTATION[stage], path: key },
+      { retryTransportFailures: false },
+    );
+  } catch (error) {
+    // Shopify answered no — access denied, throttled, malformed: refused.
+    // Anything else means the outcome is unknown, so it is not a refusal.
+    if (error instanceof ShopifyResponseError) {
+      throw new BulkStartRefused(error.message, stage);
+    }
+    throw error;
+  }
+
+  const runErrors = run.bulkOperationRunMutation.userErrors;
+  if (runErrors.length || !run.bulkOperationRunMutation.bulkOperation) {
+    throw new BulkStartRefused(
+      `Shopify refused the bulk operation: ${
+        runErrors.map((e) => e.message).join("; ") || "no operation returned"
+      }`,
+      stage,
+    );
+  }
+
+  return run.bulkOperationRunMutation.bulkOperation.id;
+}
+
+/** Stage the JSONL and return the upload's `key`, the run mutation's `path`. */
+async function stageUpload(
+  client: ThrottledAdmin,
+  stage: MutationStage,
+  units: MutationUnit[],
+): Promise<string> {
   const jsonl = units.map((unit) => JSON.stringify(unit.variables)).join("\n");
 
   const staged = await client.run<{
@@ -147,24 +230,7 @@ export async function startBulkStage(
 
   const key = target.parameters.find((p) => p.name === "key")?.value;
   if (!key) throw new Error("Staged upload returned no key");
-
-  const run = await client.run<{
-    bulkOperationRunMutation: {
-      bulkOperation: { id: string; status: string } | null;
-      userErrors: { field: string[] | null; message: string; code: string | null }[];
-    };
-  }>(RUN_MUTATION, { mutation: STAGE_MUTATION[stage], path: key });
-
-  const runErrors = run.bulkOperationRunMutation.userErrors;
-  if (runErrors.length || !run.bulkOperationRunMutation.bulkOperation) {
-    throw new Error(
-      `Shopify refused the bulk operation: ${
-        runErrors.map((e) => e.message).join("; ") || "no operation returned"
-      }`,
-    );
-  }
-
-  return run.bulkOperationRunMutation.bulkOperation.id;
+  return key;
 }
 
 export async function fetchBulkOperation(

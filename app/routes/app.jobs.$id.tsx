@@ -48,6 +48,7 @@ import {
   isPending,
   jobStatusLabel,
   jobStatusTone,
+  undoExpiredMessage,
 } from "../lib/jobs";
 import { parseActions } from "../lib/actions";
 import { formatValue } from "../lib/mutations";
@@ -122,6 +123,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     ]);
 
   const filteredTotal = onlyFailed ? failed : total;
+
+  // Past the retention window the snapshot rows are gone (retention.server.ts),
+  // so the counts come from the job row, which kept them.
+  const pruned = job.snapshotsPrunedAt;
+  const counts = pruned
+    ? {
+        applied: Math.max(0, job.totalItems - job.failedItems),
+        failed: job.failedItems,
+        drifted: 0,
+        total: job.totalItems,
+      }
+    : { applied, failed, drifted, total };
   const labels = await fetchOwnerLabels(
     admin,
     rows.map((row) => row.ownerGid),
@@ -156,8 +169,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       completedAt: job.completedAt?.toISOString() ?? null,
       scheduledFor: job.scheduledFor?.toISOString() ?? null,
       revertAt: job.revertAt?.toISOString() ?? null,
+      undoExpired: pruned ? undoExpiredMessage(pruned) : null,
     },
-    counts: { applied, failed, drifted, total },
+    counts,
     rows: rowViews,
     page,
     onlyFailed,
@@ -251,7 +265,8 @@ export default function JobDetail() {
   const busy = fetcher.state !== "idle";
   const canUndo =
     (job.status === "completed" || job.status === "failed") &&
-    counts.applied > 0;
+    counts.applied > 0 &&
+    !job.undoExpired;
 
   const setParam = (key: string, value: string | null) => {
     const next = new URLSearchParams(searchParams);
@@ -295,7 +310,7 @@ export default function JobDetail() {
           : undefined
       }
       secondaryActions={[
-        ...(counts.failed > 0 && !active
+        ...(counts.failed > 0 && !active && !job.undoExpired
           ? [
               {
                 content: `Retry ${counts.failed} failed row${counts.failed === 1 ? "" : "s"}`,
@@ -343,6 +358,12 @@ export default function JobDetail() {
               undoJob={undoJob}
               original={original}
             />
+
+            {job.undoExpired ? (
+              <Banner tone="info" title="Undo has expired for this edit">
+                <p>{job.undoExpired}</p>
+              </Banner>
+            ) : null}
 
             <Card>
               <BlockStack gap="300">
@@ -414,14 +435,20 @@ export default function JobDetail() {
               ) : (
                 <EmptyState
                   heading={
-                    active ? "No rows yet" : "This job recorded no changes"
+                    job.undoExpired
+                      ? "Row details have expired"
+                      : active
+                        ? "No rows yet"
+                        : "This job recorded no changes"
                   }
                   image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
                 >
                   <p>
-                    {active
-                      ? "The before-values are still being recorded. Nothing has been written yet."
-                      : "Nothing in the selection needed changing."}
+                    {job.undoExpired
+                      ? "The per-row before and after values were deleted with this edit’s undo data. The totals above are kept."
+                      : active
+                        ? "The before-values are still being recorded. Nothing has been written yet."
+                        : "Nothing in the selection needed changing."}
                   </p>
                 </EmptyState>
               )}
@@ -457,6 +484,7 @@ function StatusBanner({
     isUndo: boolean;
     scheduledFor: string | null;
     revertAt: string | null;
+    undoExpired: string | null;
   };
   counts: { applied: number; failed: number; drifted: number };
   undoJob: { id: string; name: string; status: string } | null;
@@ -520,7 +548,7 @@ function StatusBanner({
     return (
       <Banner tone="critical" title="This edit failed">
         <p>{job.error ?? "Shopify rejected every change in this job."}</p>
-        {counts.applied > 0 ? (
+        {counts.applied > 0 && !job.undoExpired ? (
           <p>
             {counts.applied.toLocaleString()} change
             {counts.applied === 1 ? "" : "s"} did land, and undo will reverse
@@ -558,7 +586,7 @@ function StatusBanner({
             <p>
               Reversed <Link url={`/app/jobs/${original.id}`}>{original.name}</Link>.
             </p>
-          ) : (
+          ) : job.undoExpired ? null : (
             <p>Undo restores every one of them exactly, on any plan.</p>
           )}
           {counts.drifted > 0 ? (

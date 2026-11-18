@@ -112,6 +112,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       failedItems: job.failedItems,
       appliedItems: applied.get(job.id) ?? 0,
       undoJobId: undoOf.get(job.id) ?? null,
+      // Past the retention window: the rows that make undo possible are gone.
+      undoExpired: Boolean(job.snapshotsPrunedAt),
       createdAt: job.createdAt.toISOString(),
     })),
   };
@@ -309,6 +311,7 @@ interface JobView {
   failedItems: number;
   appliedItems: number;
   undoJobId: string | null;
+  undoExpired: boolean;
 }
 
 function ChangeCount({ job }: { job: JobView }) {
@@ -340,6 +343,15 @@ function UndoCell({
       <Button variant="plain" url={`/app/jobs/${job.undoJobId}`}>
         View undo
       </Button>
+    );
+  }
+  // Before the applied check: a pruned job counts zero applied rows, and
+  // showing nothing would read as "this edit changed nothing".
+  if (job.undoExpired) {
+    return (
+      <Text as="span" variant="bodySm" tone="subdued">
+        Undo expired
+      </Text>
     );
   }
   if (isActive(job.status) || job.appliedItems === 0) return null;

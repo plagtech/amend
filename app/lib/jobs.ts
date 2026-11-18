@@ -126,6 +126,25 @@ export const FREE_TEMPLATE_LIMIT = 3;
 export const CYCLE_DAYS = 30;
 
 /**
+ * How long a finished job's before-values (its undo) are kept, by the shop's
+ * plan *now* — SPEC §7. A downgrade shortens the window for old jobs; it never
+ * blocks an undo that is still inside it. Enforced by the retention sweep in
+ * `retention.server.ts`.
+ */
+export const SNAPSHOT_RETENTION_DAYS = { free: 90, pro: 365 } as const;
+
+/** What a merchant is told when an edit is past its undo window. */
+export function undoExpiredMessage(prunedAt: Date | string): string {
+  const date = new Date(prunedAt).toLocaleDateString();
+  return (
+    `Undo for this edit expired on ${date}. Its before-values were kept for ` +
+    `${SNAPSHOT_RETENTION_DAYS.free} days on the Free plan ` +
+    `(${SNAPSHOT_RETENTION_DAYS.pro} on Pro) and have been deleted. ` +
+    "The edit itself is unaffected."
+  );
+}
+
+/**
  * Line-items at or below which a job runs inline as batched mutations instead
  * of going through Bulk Operations.
  *

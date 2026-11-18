@@ -95,6 +95,14 @@ model EditJob {
   // same stage. Expires on its own so a killed process cannot wedge a job.
   reconcileLockAt DateTime?
 
+  // --- Phase 7 -------------------------------------------------------------
+  // When this job's before-values were deleted under the retention rule
+  // (SPEC §7: 90 days free, 365 Pro — app/lib/retention.server.ts). Durable on
+  // purpose: the snapshot rows are what the Undo buttons and the job page's
+  // counts are computed from, so without this a pruned job would simply lose
+  // its Undo button with no explanation. With it, undo reads as *expired*.
+  snapshotsPrunedAt DateTime?
+
   @@index([shopId])
   @@index([shopId, status])
   // The orphaned-queue sweep: queued jobs for one shop, oldest first.
@@ -102,6 +110,8 @@ model EditJob {
   // The scheduler tick, which asks "anything due?" across every shop.
   @@index([status, scheduledFor])
   @@index([revertAt])
+  // The retention sweep: finished jobs whose snapshots are still on disk.
+  @@index([status, snapshotsPrunedAt])
 }
 
 model Snapshot {

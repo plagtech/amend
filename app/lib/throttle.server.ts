@@ -48,6 +48,15 @@ export interface GraphqlResult<T> {
   };
 }
 
+/**
+ * Shopify answered, and the answer was no: a GraphQL `errors` array (access
+ * denied among them), a response with no `data`, or throttling on every
+ * attempt. Distinct from a transport failure, where the request may or may not
+ * have reached Shopify — callers that must never apply something twice need
+ * to know which one they are looking at.
+ */
+export class ShopifyResponseError extends Error {}
+
 export class ThrottledAdmin {
   private available: number | null = null;
   private restoreRate = DEFAULT_RESTORE_RATE;
@@ -72,7 +81,18 @@ export class ThrottledAdmin {
   async run<T = Record<string, unknown>>(
     query: string,
     variables: Record<string, unknown> = {},
+    options: {
+      /**
+       * Retry after a transport failure (default true). Off for a call that
+       * must not run twice: if the first attempt reached Shopify, a retry's
+       * answer ("already in progress") would describe the first attempt, not a
+       * refusal. With this off, a transport failure throws a plain Error —
+       * outcome unknown — and only a real answer throws ShopifyResponseError.
+       */
+      retryTransportFailures?: boolean;
+    } = {},
   ): Promise<T> {
+    const retryTransport = options.retryTransportFailures ?? true;
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
@@ -88,6 +108,7 @@ export class ThrottledAdmin {
         };
       } catch (error) {
         lastError = error as Error;
+        if (!retryTransport) throw lastError;
       }
 
       if (body) {
@@ -95,11 +116,12 @@ export class ThrottledAdmin {
         const throttled = status === 429 || isThrottled(body.errors);
         if (!throttled) {
           const message = errorMessage(body.errors);
-          if (message) throw new Error(message);
-          if (!body.data) throw new Error("Shopify returned no data");
+          if (message) throw new ShopifyResponseError(message);
+          if (!body.data) throw new ShopifyResponseError("Shopify returned no data");
           return body.data;
         }
-        lastError = new Error("Throttled by Shopify");
+        // A throttled request was not executed.
+        lastError = new ShopifyResponseError("Throttled by Shopify");
         // A throttle means the bucket is empty regardless of what the last
         // successful response said.
         this.available = 0;

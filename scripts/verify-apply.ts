@@ -10,6 +10,9 @@
  *
  *   npm run verify:apply           # the inline path: ~6 products, seconds
  *   npm run verify:apply -- --bulk # the Bulk Operations path: ~100, minutes
+ *   npm run verify:refusal         # --bulk three times, with Shopify refusing
+ *                                  # to start a bulk stage (--refuse=first,
+ *                                  # --refuse=later, --refuse=undo)
  *
  * It calls `createApplyJob` / `runJob` / `createUndoJob` — the same functions
  * the routes call — so a regression in the engine fails here rather than in a
@@ -44,8 +47,9 @@ import {
   reconcileBulkJob,
   runJob,
 } from "../app/lib/apply.server";
+import { setBulkRefusalForTesting } from "../app/lib/bulk.server";
 import { emptyFilters } from "../app/lib/filters";
-import { isTerminal, jobName } from "../app/lib/jobs";
+import { SYNC_ITEM_LIMIT, isTerminal, jobName } from "../app/lib/jobs";
 import type { JobScope } from "../app/lib/snapshots.server";
 import { collectMatchingProducts } from "../app/lib/products.server";
 import { sleep } from "../app/lib/throttle.server";
@@ -519,11 +523,88 @@ async function runToCompletion(
   }
 }
 
+// --- forcing a bulk refusal --------------------------------------------------
+
+/**
+ * Which bulk start Shopify "refuses" in this run. The refusal is injected at
+ * the exact point a real one arrives — `startBulkStage`, after staging, in
+ * place of Shopify's answer to `bulkOperationRunMutation` — so everything
+ * from there on is the production code path.
+ *
+ *   first  the apply's first stage (variant): the whole edit falls back inline
+ *   later  the apply's second stage (product), after bulk applied the first
+ *   undo   the undo's first stage: a >100-item undo, entirely inline
+ */
+type RefuseCase = "first" | "later" | "undo";
+
+const REFUSAL_MESSAGE =
+  "Access denied for bulkOperationRunMutation field. (forced by verify-apply)";
+
+function refuseCase(): RefuseCase | null {
+  const flag = process.argv.find((arg) => arg.startsWith("--refuse="));
+  if (!flag) return null;
+  const value = flag.slice("--refuse=".length);
+  if (value === "first" || value === "later" || value === "undo") return value;
+  throw new Error(`Unknown --refuse=${value}; use first, later or undo.`);
+}
+
+/** Refusals actually injected, by stage, so each case can prove it ran. */
+const refusedStages: string[] = [];
+
+function refuse(which: "every" | "product"): void {
+  setBulkRefusalForTesting((stage) => {
+    if (which === "product" && stage !== "product") return null;
+    refusedStages.push(stage);
+    return REFUSAL_MESSAGE;
+  });
+}
+
+/** The owner-facing log line, captured so the run can assert it was loud. */
+const refusalLogs: string[] = [];
+const realConsoleError = console.error.bind(console);
+console.error = (...args: unknown[]) => {
+  const line = args.map(String).join(" ");
+  if (line.includes("[bulk] REFUSED")) refusalLogs.push(line);
+  realConsoleError(...args);
+};
+
+/**
+ * Sample a job's heartbeat while it runs and report the stalest it got while
+ * `running`. The stale sweep requeues a running job whose heartbeat is older
+ * than three minutes, so an inline fallback that stopped beating would be run
+ * a second time in production. Sampled from the same process as the run, the
+ * way the sweep would see it from another.
+ */
+function watchHeartbeat(jobId: string): () => number {
+  let worst = 0;
+  const timer = setInterval(() => {
+    void db.editJob
+      .findUnique({
+        where: { id: jobId },
+        select: { status: true, heartbeatAt: true },
+      })
+      .then((job) => {
+        if (job?.status !== "running" || !job.heartbeatAt) return;
+        worst = Math.max(worst, Date.now() - job.heartbeatAt.getTime());
+      })
+      .catch(() => {});
+  }, 1_000);
+  return () => {
+    clearInterval(timer);
+    return worst;
+  };
+}
+
+/** Comfortably under the sweep's three minutes, and well over one beat. */
+const HEARTBEAT_LIMIT_MS = 60_000;
+
 // --- the run ----------------------------------------------------------------
 
 async function main(): Promise<void> {
   loadEnvFile();
-  const bulk = process.argv.includes("--bulk");
+  const refusal = refuseCase();
+  // A refusal only means something on the bulk path.
+  const bulk = process.argv.includes("--bulk") || refusal !== null;
   const shop = process.env.SEED_SHOP_DOMAIN;
   const token = process.env.SEED_ADMIN_TOKEN;
   if (!shop || !token) {
@@ -575,7 +656,9 @@ async function main(): Promise<void> {
       : { mode: "some", ids: selectedIds };
 
     console.log(
-      `Mode: ${bulk ? "Bulk Operations" : "inline"} · ${inScope.length} products match ` +
+      `Mode: ${bulk ? "Bulk Operations" : "inline"}${
+        refusal ? ` · Shopify refuses: ${refusal}` : ""
+      } · ${inScope.length} products match ` +
         `${filters.skuPrefix} · editing ${selectedIds.length}, holding ${untouchedIds.length} back\n`,
     );
 
@@ -702,7 +785,12 @@ async function main(): Promise<void> {
       idempotencyKey: applyKey,
     });
     created.push(job.id);
+    if (refusal === "first") refuse("every");
+    if (refusal === "later") refuse("product");
+    const applyBeat = watchHeartbeat(job.id);
     const applied = await runToCompletion(admin, job.id);
+    const applyWorstBeat = applyBeat();
+    setBulkRefusalForTesting(null);
 
     const rows = await db.snapshot.findMany({ where: { jobId: job.id } });
     // Four rows per variant (price, policy, barcode, weight) for every selected
@@ -715,7 +803,53 @@ async function main(): Promise<void> {
       (selectedIds.length - 1) * PRODUCT_ROWS_PER_PRODUCT;
 
     check("job completed", applied.status, "completed");
-    check("took the expected path", applied.mode, bulk ? "bulk" : "sync");
+    // A refused apply ends inline: that is the fallback, and the evidence it ran.
+    check(
+      "took the expected path",
+      applied.mode,
+      !bulk || refusal === "first" || refusal === "later" ? "sync" : "bulk",
+    );
+    if (refusal === "first" || refusal === "later") {
+      console.log(`\nRefusal (${refusal} stage) — the apply fell back inline:`);
+      check(
+        "Shopify was asked, and refused, exactly the stage this case targets",
+        refusedStages,
+        refusal === "first" ? ["variant"] : ["product"],
+      );
+      check("the job carries no error for the merchant", applied.error, null);
+      assertTrue(
+        "the refusal was logged loudly, with Shopify's message",
+        refusalLogs.some((line) => line.includes(REFUSAL_MESSAGE)),
+      );
+      assertTrue(
+        `the heartbeat stayed fresh through the inline run (stalest ${Math.round(
+          applyWorstBeat / 1000,
+        )}s)`,
+        applyWorstBeat < HEARTBEAT_LIMIT_MS,
+      );
+      const stageRows = await db.snapshot.findMany({
+        where: { jobId: job.id },
+        select: { fieldPath: true, bulkLine: true },
+      });
+      const variantRows = stageRows.filter((r) => r.fieldPath.startsWith("variant."));
+      const productRows = stageRows.filter((r) => r.fieldPath.startsWith("product."));
+      if (refusal === "later") {
+        assertTrue(
+          "the first stage went through Bulk Operations before the refusal",
+          variantRows.length > 0 && variantRows.every((r) => r.bulkLine !== null),
+        );
+      } else {
+        assertTrue(
+          "no row went through Bulk Operations",
+          variantRows.every((r) => r.bulkLine === null),
+        );
+      }
+      assertTrue(
+        "the refused stage went inline",
+        productRows.every((r) => r.bulkLine === null),
+      );
+      refusedStages.length = 0;
+    }
     check("no failures", applied.failedItems, 0);
     check("snapshot rows", rows.length, expectedRows);
     check("job.totalItems matches the snapshot", applied.totalItems, rows.length);
@@ -890,7 +1024,31 @@ async function main(): Promise<void> {
     console.log("\nUndo:");
     const undo = await createUndoJob(shop, job.id);
     created.push(undo.id);
+    if (refusal === "undo") refuse("every");
+    const undoBeat = watchHeartbeat(undo.id);
     const undone = await runToCompletion(admin, undo.id);
+    const undoWorstBeat = undoBeat();
+    setBulkRefusalForTesting(null);
+    if (refusal === "undo") {
+      console.log("Refusal — the >100-item undo fell back inline:");
+      assertTrue(
+        `the undo is large enough to be a bulk job (${undone.totalItems} items)`,
+        undone.totalItems > SYNC_ITEM_LIMIT,
+      );
+      check("Shopify refused the undo's first stage", refusedStages, ["variant"]);
+      check("and the undo finished inline", undone.mode, "sync");
+      check("the undo carries no error for the merchant", undone.error, null);
+      assertTrue(
+        "the refusal was logged loudly, with Shopify's message",
+        refusalLogs.some((line) => line.includes(REFUSAL_MESSAGE)),
+      );
+      assertTrue(
+        `the heartbeat stayed fresh through the inline undo (stalest ${Math.round(
+          undoWorstBeat / 1000,
+        )}s)`,
+        undoWorstBeat < HEARTBEAT_LIMIT_MS,
+      );
+    }
     const undoRows = await db.snapshot.findMany({ where: { jobId: undo.id } });
 
     check("undo completed", undone.status, "completed");
@@ -944,6 +1102,7 @@ async function main(): Promise<void> {
       ),
     );
   } finally {
+    setBulkRefusalForTesting(null);
     // The catalog restores itself via undo; the job rows are this script's
     // litter and would otherwise pile up in the merchant-facing history.
     if (created.length) {

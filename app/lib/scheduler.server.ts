@@ -51,6 +51,7 @@ import {
   spendCreditForScheduledJob,
 } from "./apply.server";
 import { PlanLimitError } from "./billing.server";
+import { maybePruneSnapshots } from "./retention.server";
 
 export interface SchedulerOptions {
   /**
@@ -73,6 +74,8 @@ export interface TickResult {
   reverted: number;
   swept: number;
   refused: number;
+  /** Jobs whose expired undo data was deleted (at most one pass an hour). */
+  pruned: number;
 }
 
 const EMPTY_TICK: TickResult = {
@@ -80,6 +83,7 @@ const EMPTY_TICK: TickResult = {
   reverted: 0,
   swept: 0,
   refused: 0,
+  pruned: 0,
 };
 
 declare global {
@@ -135,7 +139,8 @@ export function stopScheduler(): void {
 }
 
 /**
- * One pass: fire what is due, revert what has expired, resume what stalled.
+ * One pass: fire what is due, revert what has expired, resume what stalled,
+ * and (hourly) delete undo data past its retention window.
  *
  * Exported so the verification script can run a tick directly rather than
  * waiting on wall-clock time.
@@ -151,11 +156,18 @@ export async function runSchedulerTick(
       await fireDueReverts(options),
       await sweepActiveShops(),
     ];
+    // Last, and isolated: retention is housekeeping, and a failure in it must
+    // never stop a scheduled edit or a revert from firing on the next tick.
+    const pruned = await maybePruneSnapshots().catch((error) => {
+      console.error("[scheduler] snapshot retention failed:", error);
+      return 0;
+    });
     return {
       promoted: fired.promoted,
       refused: fired.refused,
       reverted,
       swept,
+      pruned,
     };
   } finally {
     ticking = false;

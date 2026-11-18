@@ -25,6 +25,8 @@
  * for real, so nothing here can cost anyone money.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import process from "node:process";
 
 import db from "../app/db.server";
@@ -36,8 +38,11 @@ import {
   PRO_PRICE,
   PRO_TRIAL_DAYS,
   assertActionsAllowed,
+  billingReturnUrl,
+  isDevelopmentStore,
   planFor,
   syncPlan,
+  testChargesFor,
 } from "../app/lib/billing.server";
 import { emptyFilters } from "../app/lib/filters";
 import { FREE_TEMPLATE_LIMIT } from "../app/lib/jobs";
@@ -106,6 +111,30 @@ const CANCEL_MUTATION = `#graphql
   }
 `;
 
+/**
+ * The client id of the app whose offline session this script bills as.
+ * `SHOPIFY_API_KEY` is blank in `.env` (the CLI injects it only into
+ * `shopify app dev`), so fall back to the registration `npm run dev` installs
+ * on the dev store: `shopify.app.dev.toml` (DEPLOY.md §6 step 0). The
+ * production `shopify.app.toml` is never the dev store's app. Never a host:
+ * see `billingReturnUrl`.
+ */
+function appClientId(): string {
+  if (process.env.SHOPIFY_API_KEY) return process.env.SHOPIFY_API_KEY;
+  const path = resolve(process.cwd(), "shopify.app.dev.toml");
+  let toml: string;
+  try {
+    toml = readFileSync(path, "utf8");
+  } catch {
+    throw new Error(
+      "No shopify.app.dev.toml — link the dev registration first (DEPLOY.md §6 step 0).",
+    );
+  }
+  const match = /^\s*client_id\s*=\s*"([^"]+)"/m.exec(toml);
+  if (!match) throw new Error("No client_id in shopify.app.dev.toml.");
+  return match[1];
+}
+
 interface Subscription {
   id: string;
   name: string;
@@ -121,6 +150,9 @@ async function main(): Promise<void> {
     console.error("Set DATABASE_URL in .env.");
     process.exit(1);
   }
+  // Before anything touches the store: a missing dev registration should stop
+  // the run here, not after a leftover subscription has been cancelled.
+  const clientId = appClientId();
 
   // The app's own credentials, as stored at install time. Not the seed token:
   // only the app can bill for the app.
@@ -198,6 +230,17 @@ async function main(): Promise<void> {
       (message) => message.includes("Regular-expression"),
     );
 
+    // --- test charges on a development store -------------------------------
+    // The same query and rule the billing page uses, against the real shop.
+    console.log("\nTest charges — the store as Shopify describes it:");
+    const developmentStore = await isDevelopmentStore((query) => gql(query));
+    check("Shopify reports a development store", developmentStore, true);
+    check(
+      "so even a production deploy creates a test charge here",
+      testChargesFor({ developmentStore, env: { NODE_ENV: "production" } }),
+      true,
+    );
+
     // --- subscribe ---------------------------------------------------------
     console.log("\nSubscribe — a test charge, created by the app:");
     const created = await gql<{
@@ -208,7 +251,7 @@ async function main(): Promise<void> {
       };
     }>(CREATE_MUTATION, {
       name: PRO_PLAN,
-      returnUrl: `${process.env.SHOPIFY_APP_URL || `https://${shop}/admin`}/app/settings?upgraded=1`,
+      returnUrl: billingReturnUrl(shop, clientId),
       test: true,
       trialDays: PRO_TRIAL_DAYS,
       lineItems: [

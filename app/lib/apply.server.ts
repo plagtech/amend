@@ -43,12 +43,18 @@ import db from "../db.server";
 import type { EditAction } from "./actions";
 import { parseActions } from "./actions";
 import { PlanLimitError, assertActionsAllowed } from "./billing.server";
-import { fetchBulkOperation, fetchBulkResults, startBulkStage } from "./bulk.server";
+import {
+  BulkStartRefused,
+  fetchBulkOperation,
+  fetchBulkResults,
+  startBulkStage,
+} from "./bulk.server";
 import {
   CYCLE_DAYS,
   FREE_JOB_LIMIT,
   SYNC_ITEM_LIMIT,
   VARIANTS_PER_MUTATION,
+  undoExpiredMessage,
   undoJobName,
 } from "./jobs";
 import type { MutationStage, MutationUnit } from "./mutations";
@@ -361,11 +367,26 @@ export async function createUndoJob(
   if (original.status === "queued" || original.status === "snapshotting" || original.status === "running") {
     throw new JobRequestError("This job is still running — wait for it to finish before undoing it.");
   }
+  // Before the applied count: a pruned job has no rows, and "changed nothing"
+  // would be a false explanation for an edit that changed plenty.
+  if (original.snapshotsPrunedAt) {
+    throw new JobRequestError(undoExpiredMessage(original.snapshotsPrunedAt));
+  }
 
   const applied = await db.snapshot.count({
     where: { jobId, applied: true },
   });
   if (applied === 0) {
+    // A sweep may have committed since the check above. It stamps the job and
+    // deletes the rows in one transaction, so zero rows plus a stamp means
+    // expired, not "changed nothing".
+    const again = await db.editJob.findUnique({
+      where: { id: jobId },
+      select: { snapshotsPrunedAt: true },
+    });
+    if (again?.snapshotsPrunedAt) {
+      throw new JobRequestError(undoExpiredMessage(again.snapshotsPrunedAt));
+    }
     throw new JobRequestError("This job changed nothing, so there is nothing to undo.");
   }
 
@@ -377,17 +398,29 @@ export async function createUndoJob(
   });
   if (existing) return existing;
 
-  return db.editJob.create({
-    data: {
-      shopId,
-      name: undoJobName(original.name),
-      status: "queued",
-      undoOfJobId: jobId,
-      // Carried for display only. An undo resolves its rows from the original
-      // job's snapshots, never by re-running this filter.
-      filterJson: original.filterJson ?? Prisma.JsonNull,
-      actionsJson: original.actionsJson ?? Prisma.JsonNull,
-    },
+  // The same row lock the retention sweep takes (retention.server.ts). Either
+  // the prune committed first — and this sees `snapshotsPrunedAt` and refuses
+  // with the expired message — or this undo is created first, and the prune
+  // sees an undo in flight and leaves the rows alone. Never an undo job with
+  // nothing to restore.
+  return db.$transaction(async (tx) => {
+    const [locked] = await tx.$queryRaw<{ snapshotsPrunedAt: Date | null }[]>`
+      SELECT "snapshotsPrunedAt" FROM "EditJob" WHERE "id" = ${jobId} FOR UPDATE`;
+    if (locked?.snapshotsPrunedAt) {
+      throw new JobRequestError(undoExpiredMessage(locked.snapshotsPrunedAt));
+    }
+    return tx.editJob.create({
+      data: {
+        shopId,
+        name: undoJobName(original.name),
+        status: "queued",
+        undoOfJobId: jobId,
+        // Carried for display only. An undo resolves its rows from the original
+        // job's snapshots, never by re-running this filter.
+        filterJson: original.filterJson ?? Prisma.JsonNull,
+        actionsJson: original.actionsJson ?? Prisma.JsonNull,
+      },
+    });
   });
 }
 
@@ -454,6 +487,11 @@ export async function retryFailedRows(
   if (!job) throw new JobRequestError("That job no longer exists.");
   if (job.status !== "completed" && job.status !== "failed") {
     throw new JobRequestError("This job is still running.");
+  }
+  if (job.snapshotsPrunedAt) {
+    throw new JobRequestError(
+      "This edit's row data has expired, so its failed rows can no longer be retried. Run the edit again instead.",
+    );
   }
 
   const cleared = await db.snapshot.updateMany({
@@ -684,6 +722,17 @@ async function undoDraftsFor(
   admin: AdminApiContext,
   originalJobId: string,
 ): Promise<SnapshotDraft[]> {
+  // Unreachable while createUndoJob and the retention sweep share their row
+  // lock. Kept so that, if that ever regresses, the job says why instead of
+  // "completing" an undo that restored nothing.
+  const original = await db.editJob.findUnique({
+    where: { id: originalJobId },
+    select: { snapshotsPrunedAt: true },
+  });
+  if (original?.snapshotsPrunedAt) {
+    throw new Error(undoExpiredMessage(original.snapshotsPrunedAt));
+  }
+
   const applied = await db.snapshot.findMany({
     where: { jobId: originalJobId, applied: true },
     select: {
@@ -821,7 +870,16 @@ async function advanceBulk(
     if (!units.length) continue;
 
     await assignBulkLines(units);
-    const gid = await startBulkStage(admin, stage, units);
+    let gid: string;
+    try {
+      gid = await startBulkStage(admin, stage, units);
+    } catch (error) {
+      if (!(error instanceof BulkStartRefused)) throw error;
+      // Certainly not started — so every row still unapplied, in this stage
+      // and any after it, can go inline without risk of a second write.
+      await continueInlineAfterRefusal(admin, job, error);
+      return;
+    }
     await db.editJob.update({
       where: { id: job.id },
       data: { bulkOpGid: gid, stage, heartbeatAt: new Date() },
@@ -829,6 +887,63 @@ async function advanceBulk(
     return;
   }
 
+  await finishJob(job.id);
+}
+
+/**
+ * Shopify would not start a bulk stage: finish the job inline instead.
+ *
+ * The usual cause is that bulk-mutation access has lapsed (it must be enabled
+ * per app and expires after 31 days without a bulk mutation — DEPLOY.md
+ * §6 step 12a). That is the owner's problem to see, not the merchant's, so it
+ * is logged loudly and the job carries no error: from the job page it simply
+ * runs inline, which is slower.
+ *
+ * Distinct from `fallBackToInline`, which handles an operation Shopify
+ * *accepted* and then failed or lost, and has to settle its partial results
+ * first. Here nothing of the refused stage ran, so there is nothing to settle:
+ * rows from earlier stages that bulk already applied are `applied: true` and
+ * `pendingFor` skips them, so nothing is applied twice.
+ *
+ * Runs immediately, on whichever path hit the refusal — `executeJob` for the
+ * first stage, the reconcile for a later one, either for an undo — rather than
+ * leaving the job for the stale sweep.
+ */
+async function continueInlineAfterRefusal(
+  admin: AdminApiContext,
+  job: EditJob,
+  refusal: BulkStartRefused,
+): Promise<void> {
+  console.error(
+    `[bulk] REFUSED: Shopify would not start the ${refusal.stage} stage of job ${job.id} ` +
+      `for ${job.shopId}: ${refusal.message} — bulk mutation access may have lapsed ` +
+      "(Partner Dashboard → API access requests). Finishing the job inline.",
+  );
+
+  // The heartbeat is stamped here because a later-stage refusal arrives after
+  // minutes of waiting on Shopify, with nothing having touched it; the inline
+  // run then keeps it fresh unit by unit. Clearing `bulkOpGid` and `stage`
+  // first is what stops the webhook and any second reconcile entrant from
+  // treating this as a bulk job again.
+  await db.editJob.update({
+    where: { id: job.id },
+    data: {
+      mode: "sync",
+      stage: null,
+      bulkOpGid: null,
+      heartbeatAt: new Date(),
+    },
+  });
+  // Line numbers belonged to an upload Shopify never ran.
+  await db.snapshot.updateMany({
+    where: { jobId: job.id, applied: false, bulkLine: { not: null } },
+    data: { bulkLine: null },
+  });
+
+  const fresh = await db.editJob.findUnique({ where: { id: job.id } });
+  if (!fresh) return;
+  await assertSnapshotsComplete(fresh);
+  await runInline(admin, fresh);
   await finishJob(job.id);
 }
 
@@ -916,8 +1031,14 @@ async function releaseReconcile(jobId: string): Promise<void> {
 
 async function reconcileClaimed(
   admin: AdminApiContext,
-  job: EditJob,
+  seen: EditJob,
 ): Promise<void> {
+  // Re-read under the claim. The caller's copy may predate a refusal that
+  // switched the job to inline (bulkOpGid cleared) or a stage that has since
+  // advanced; acting on it would reconcile an operation that is no longer the
+  // job's, and could start a stage twice.
+  const job = await db.editJob.findUnique({ where: { id: seen.id } });
+  if (!job || job.status !== "running" || job.mode !== "bulk") return;
   if (!job.bulkOpGid || !job.stage) return;
   const stage = job.stage as MutationStage;
 
@@ -1223,6 +1344,23 @@ async function finishJob(jobId: string): Promise<void> {
 }
 
 async function failJob(jobId: string, message: string): Promise<void> {
+  // A failed job must not leave rows that are neither applied nor failed:
+  // Retry only looks for rows with an error, so those would be stranded with
+  // nothing able to finish them. Give each one the job's reason — unless a
+  // bulk operation is known to be in flight for them, in which case Shopify
+  // may still apply them and a retry could write them a second time.
+  const job = await db.editJob.findUnique({
+    where: { id: jobId },
+    select: { mode: true, bulkOpGid: true, stage: true },
+  });
+  const bulkInFlight = job?.mode === "bulk" && !!job.bulkOpGid && !!job.stage;
+  if (job && !bulkInFlight) {
+    await db.snapshot.updateMany({
+      where: { jobId, applied: false, error: null },
+      data: { error: `Not applied: ${message}`.slice(0, 500) },
+    });
+  }
+
   const failed = await db.snapshot.count({
     where: { jobId, error: { not: null } },
   });
