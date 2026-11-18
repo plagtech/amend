@@ -131,6 +131,8 @@ Snapshot retention: cron deletes snapshots > 90 days old (free) / > 365 days (pr
 3. Subscribe to `bulk_operations/finish` webhook → parse result JSONL → mark per-row applied/error.
 4. If Shopify bulk op fails wholesale, fall back to chunked sync mutations via BullMQ worker.
 
+**Known untested path:** a transport failure on the `bulkOperationRunMutation` call itself. The request may have reached Shopify, so the job is not retried or fallen back to inline; it fails, and **Retry** can finish it. DEPLOY.md §6 "If bulk access is missing" documents the reasoning.
+
 **Invariants:**
 - Never begin mutations until 100% of snapshots are persisted. Undo integrity is the brand.
 - Jobs are idempotent/resumable: each Snapshot row tracks `applied`, so a crashed worker resumes without double-applying.
