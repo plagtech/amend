@@ -1661,14 +1661,27 @@ function TagFields({
           />
         ) : (
           <>
-            <TextField
-              label="Tag"
-              value={input}
-              onChange={setInput}
-              onBlur={commit}
-              placeholder="Type a tag, press Enter"
-              autoComplete="off"
-            />
+            {/* Polaris TextField has no onKeyDown prop; the keydown bubbles up
+                from its input. isComposing skips the Enter that confirms an
+                IME candidate, which is not a request to add the tag. */}
+            <div
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.nativeEvent.isComposing) {
+                  return;
+                }
+                event.preventDefault();
+                commit();
+              }}
+            >
+              <TextField
+                label="Tag"
+                value={input}
+                onChange={setInput}
+                onBlur={commit}
+                placeholder="Type a tag, press Enter"
+                autoComplete="off"
+              />
+            </div>
             <Button onClick={commit} disabled={!input.trim()}>
               Add tag
             </Button>
