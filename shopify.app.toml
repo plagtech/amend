@@ -9,7 +9,6 @@ embedded = true
 
 [build]
 automatically_update_urls_on_dev = false
-include_config_on_deploy = true
 
 [webhooks]
 # Keep in step with `ApiVersion.July26` in app/shopify.server.ts, .graphqlrc.ts,
