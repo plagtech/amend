@@ -302,7 +302,9 @@ client id is not secret); committing it means a fresh clone can run
 12. `npm run deploy` (= `shopify app deploy --config shopify.app.toml`). It
     pushes the URLs and registers every webhook against `https://<domain>`. In
     the Dev Dashboard, open the new version and confirm the URLs and webhook
-    endpoints show the Railway domain.
+    endpoints show the Railway domain. Expect it to remove
+    `include_config_on_deploy` from `shopify.app.toml` (config is always
+    deployed now); commit that deletion, it is not a regression.
 
 12a. **Enable bulk mutations** for cf910c16 (Shopify, Nov 6 2026: apps built
     by a Partner must opt in before running bulk operations, all API
