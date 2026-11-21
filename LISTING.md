@@ -35,8 +35,8 @@ noted so you can see the margin.
 | Meta description | **Bulk edit product prices, tags, titles, SEO, SKUs and more in one job. Preview every change exactly before it runs, and undo any edit on any plan.** (~146) |
 | Search terms (5) | `bulk edit` · `bulk product editor` · `price editor` · `product tags` · `undo` |
 | Developer name | Plagtech ⟪NEEDS YOU: confirm the exact public developer name⟫ |
-| Support email | ⟪NEEDS YOU⟫ |
-| Privacy policy URL | ⟪NEEDS YOU — on a domain you own, not `*.up.railway.app` (SPEC §8)⟫ |
+| Support email | hello@amendinbulk.app |
+| Privacy policy URL | https://amendinbulk.app/privacy |
 | Emergency developer contact | ⟪NEEDS YOU⟫ |
 | Demo store URL | optional — the seeded dev store is not public; leave blank unless you set up a password-free demo |
 
@@ -56,7 +56,7 @@ category is a review rejection (4.3.5).
 > tags, status, titles, descriptions, vendor, product type, SEO title and
 > description, SKU, barcode, weight, and inventory settings — and lets you
 > stack several of those changes into one job. Filter your catalog by
-> collection, vendor, type, tag, status, price, SKU, inventory or date, work
+> collection, vendor, type, tag, status, price, SKU or inventory, work
 > at product or variant level, and select everything that matches, not just
 > the page you can see.
 >
@@ -240,8 +240,8 @@ the plan shown → uninstall. Narrate or caption in English.
 - [ ] App URL + redirect URL on the prod domain, `shopify app deploy`,
       webhooks confirmed against the prod URL in the Dev Dashboard (§6 B).
 - [ ] Prod smoke test (DEPLOY.md §7).
-- [ ] Privacy policy on a domain you own; support email; emergency contact.
-- [ ] Landing page copy: `app/routes/_index/route.tsx` still reads
+- [ ] Emergency developer contact.
+- [x] Landing page copy: `app/routes/_index/route.tsx` still reads
       "A short heading about [your app]" — reviewers can reach it.
 - [ ] 1200 × 1200 icon; six screenshots; feature video; review screencast.
 - [ ] Confirm the app name is unique in the App Store search.

@@ -22,9 +22,12 @@ export default function App() {
   return (
     <div className={styles.index}>
       <div className={styles.content}>
-        <h1 className={styles.heading}>A short heading about [your app]</h1>
+        <h1 className={styles.heading}>
+          Amend: bulk edit your Shopify products, with preview and undo
+        </h1>
         <p className={styles.text}>
-          A tagline about [your app] that describes your value proposition.
+          Change prices, tags and text across your whole catalog, see every
+          change first, and undo any edit.
         </p>
         {showForm && (
           <Form className={styles.form} method="post" action="/auth/login">
@@ -40,18 +43,21 @@ export default function App() {
         )}
         <ul className={styles.list}>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Stack edits in one job.</strong> Prices, tags, status,
+            titles, SEO, SKUs and more, applied together.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Preview every row.</strong> See the before and after value
+            of each product before anything is written.
           </li>
           <li>
-            <strong>Product feature</strong>. Some detail about your feature and
-            its benefit to your customer.
+            <strong>Undo any edit.</strong> Every job saves the old values
+            first, so one click puts them back.
           </li>
         </ul>
+        <p className={styles.text}>
+          <a href="https://amendinbulk.app">amendinbulk.app</a>
+        </p>
       </div>
     </div>
   );
