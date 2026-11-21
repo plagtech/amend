@@ -241,8 +241,7 @@ the plan shown → uninstall. Narrate or caption in English.
       webhooks confirmed against the prod URL in the Dev Dashboard (§6 B).
 - [ ] Prod smoke test (DEPLOY.md §7).
 - [ ] Emergency developer contact.
-- [x] Landing page copy: `app/routes/_index/route.tsx` still reads
-      "A short heading about [your app]" — reviewers can reach it.
+- [x] Landing page copy (`app/routes/_index/route.tsx`).
 - [ ] 1200 × 1200 icon; six screenshots; feature video; review screencast.
 - [ ] Confirm the app name is unique in the App Store search.
 - [ ] Listing pricing entered exactly as above, trial included.
