@@ -31,9 +31,10 @@
  *
  * `Shop.plan` in Postgres. Every gate is server-side and reads that column, so
  * a gate never depends on a Shopify round-trip being fast, or on the browser
- * being honest. It is kept true by three things: the `app_subscriptions/update`
- * webhook (the moment a subscription activates, is cancelled, declined, frozen
- * or expires), a sync when the merchant lands back from the approval page, and
+ * being honest. It is kept true by: the `app_subscriptions/update` webhook (the
+ * moment a subscription activates, is cancelled, declined, frozen or expires),
+ * a reset to free on `app/uninstalled`, a sync in `afterAuth` (install and
+ * reinstall), a sync when the merchant lands back from the approval page, and
  * a sync whenever the settings page is opened.
  */
 
@@ -239,6 +240,59 @@ export async function syncPlan(
     currentPeriodEnd: paid.currentPeriodEnd ?? null,
     trialDays: paid.trialDays ?? 0,
   };
+}
+
+const INSTALLATION_PLAN_QUERY = `#graphql
+  query AmendInstallationPlan {
+    shop {
+      plan {
+        partnerDevelopment
+      }
+    }
+    currentAppInstallation {
+      activeSubscriptions {
+        id
+        name
+        status
+        test
+        trialDays
+        currentPeriodEnd
+      }
+    }
+  }
+`;
+
+/**
+ * `syncPlan` from what Shopify reports right now, for callers that have an
+ * admin client but no `billing` context — `afterAuth`.
+ *
+ * Counts test subscriptions under the same rule as the settings loader's
+ * `billing.check({ isTest })`: only where this shop gets test charges
+ * (`testChargesFor`). Otherwise a test charge would count as Pro here and not
+ * there.
+ */
+export async function syncPlanFromShopify(
+  shopId: string,
+  admin: AdminApiContext,
+): Promise<PlanState> {
+  const response = await admin.graphql(INSTALLATION_PLAN_QUERY);
+  const body = (await response.json()) as {
+    data?: {
+      shop: { plan: { partnerDevelopment: boolean } };
+      currentAppInstallation: { activeSubscriptions: SubscriptionLike[] };
+    };
+  };
+  if (!body.data) throw new Error("Shopify returned no installation plan");
+
+  const isTest = testChargesFor({
+    developmentStore: body.data.shop.plan.partnerDevelopment === true,
+    env: process.env,
+  });
+  const subscriptions =
+    body.data.currentAppInstallation.activeSubscriptions.filter(
+      (subscription) => isTest || !subscription.test,
+    );
+  return syncPlan(shopId, subscriptions);
 }
 
 /** The plan as the gates see it. Never calls Shopify — this is the gate's truth. */

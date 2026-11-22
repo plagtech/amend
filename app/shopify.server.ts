@@ -12,6 +12,7 @@ import {
   PRO_PLAN,
   PRO_PRICE,
   PRO_TRIAL_DAYS,
+  syncPlanFromShopify,
 } from "./lib/billing.server";
 
 const shopify = shopifyApp({
@@ -43,14 +44,45 @@ const shopify = shopifyApp({
     expiringOfflineAccessTokens: true,
   },
   hooks: {
-    afterAuth: async ({ session }) => {
+    afterAuth: async ({ session, admin }) => {
       // Ensure a Shop row exists (and is marked active) on every install/reauth.
       // This is the record the uninstall/redact webhooks act on.
+      //
+      // afterAuth also runs for a shop that never left (whenever it has no
+      // valid offline session), so "reinstall" means the row was inactive.
+      // Only then is the plan reset, so a live paying shop is not demoted
+      // just because the sync below failed. If `app/uninstalled` never
+      // arrived the row still looks active; the sync below is what corrects
+      // the plan in that case.
+      const previous = await prisma.shop.findUnique({
+        where: { id: session.shop },
+        select: { active: true },
+      });
+      const reinstall = previous !== null && !previous.active;
       await prisma.shop.upsert({
         where: { id: session.shop },
         create: { id: session.shop, active: true },
-        update: { active: true, uninstalledAt: null },
+        update: {
+          active: true,
+          uninstalledAt: null,
+          ...(reinstall ? { plan: "free" } : {}),
+        },
       });
+
+      // Take the plan from what Shopify reports. Must never block install:
+      // on failure the shop keeps the plan set above (free for an install or
+      // reinstall) until the webhook or the settings page syncs it.
+      try {
+        await syncPlanFromShopify(session.shop, admin);
+      } catch (error) {
+        console.error(
+          `afterAuth: plan sync failed for ${session.shop}; left on ${
+            previous === null || reinstall ? "free" : "its current plan"
+          }`,
+          error,
+        );
+      }
+
       await shopify.registerWebhooks({ session });
     },
   },

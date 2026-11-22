@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+import { downgradeToFree } from "../lib/billing.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { shop, session, topic } = await authenticate.webhook(request);
@@ -20,6 +21,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     where: { id: shop },
     data: { active: false, uninstalledAt: new Date() },
   });
+
+  // Uninstalling cancels the subscription on Shopify's side, but the
+  // `app_subscriptions/update` that says so is not guaranteed to reach an
+  // uninstalled app. Drop to free here so a reinstall never inherits Pro;
+  // `afterAuth` re-syncs whatever Shopify actually reports.
+  await downgradeToFree(shop);
 
   return new Response();
 };
