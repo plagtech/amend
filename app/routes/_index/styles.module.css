@@ -24,30 +24,6 @@
   gap: 2rem;
 }
 
-.form {
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  margin: 0 auto;
-  gap: 1rem;
-}
-
-.label {
-  display: grid;
-  gap: 0.2rem;
-  max-width: 20rem;
-  text-align: left;
-  font-size: 1rem;
-}
-
-.input {
-  padding: 0.4rem;
-}
-
-.button {
-  padding: 0.4rem;
-}
-
 .list {
   list-style: none;
   padding: 0;

@@ -415,9 +415,10 @@ logged; and that the heartbeat never went stale.
 On the dev store, against the production deploy:
 
 1. **Install from the prod URL.** Open
-   `https://<domain>/auth/login`, enter `amend-test-awe1hzlv.myshopify.com`,
-   approve the install. Lands on the Amend dashboard inside the admin, with no
-   tunnel anywhere in the iframe URL.
+   `https://<domain>/auth/login?shop=amend-test-awe1hzlv.myshopify.com`
+   (there is no shop-domain form any more) and approve the install. Lands on
+   the Amend dashboard inside the admin, with no tunnel anywhere in the iframe
+   URL.
 2. **Small edit.** New bulk edit → filter `tag:summer` → tick 3 products →
    action *Tags: add* `smoke-test` → Preview → three rows, before/after
    correct → Apply → job page shows completed, 3 items.

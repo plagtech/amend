@@ -1,67 +1,68 @@
-import { useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { Form, useActionData, useLoaderData } from "@remix-run/react";
+import type { LoaderFunctionArgs } from "@remix-run/node";
+import { useLoaderData } from "@remix-run/react";
 import {
   AppProvider as PolarisAppProvider,
-  Button,
+  Banner,
+  BlockStack,
   Card,
-  FormLayout,
+  Link,
   Page,
   Text,
-  TextField,
 } from "@shopify/polaris";
 import polarisTranslations from "@shopify/polaris/locales/en.json";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 
 import { login } from "../../shopify.server";
 
-import { loginErrorMessage } from "./error.server";
-
 export const links = () => [{ rel: "stylesheet", href: polarisStyles }];
 
+/**
+ * The configured login path. No shop-domain form (App Store requirement
+ * 2.3.1): merchants install from the App Store, and the admin opens the app
+ * embedded with `shop` and `host` already set.
+ *
+ * Still reached two ways:
+ *   - `?shop=<domain>` — `login()` validates it and throws a redirect to the
+ *     store's install page. It only returns when the domain is invalid.
+ *   - bare, when `authenticate.admin` finds no usable `shop` (a top-level
+ *     visit outside the admin). That gets the message below.
+ */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const errors = loginErrorMessage(await login(request));
+  const url = new URL(request.url);
+  const invalidShop = url.searchParams.get("shop")
+    ? Boolean((await login(request)).shop)
+    : false;
 
-  return { errors, polarisTranslations };
-};
-
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const errors = loginErrorMessage(await login(request));
-
-  return {
-    errors,
-  };
+  return { invalidShop, polarisTranslations };
 };
 
 export default function Auth() {
-  const loaderData = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
-  const [shop, setShop] = useState("");
-  const { errors } = actionData || loaderData;
+  const { invalidShop, polarisTranslations } = useLoaderData<typeof loader>();
 
   return (
-    <PolarisAppProvider i18n={loaderData.polarisTranslations}>
-      <Page>
-        <Card>
-          <Form method="post">
-            <FormLayout>
+    <PolarisAppProvider i18n={polarisTranslations}>
+      <Page narrowWidth>
+        <BlockStack gap="400">
+          {invalidShop ? (
+            <Banner tone="critical">
+              <p>That shop link isn&apos;t valid.</p>
+            </Banner>
+          ) : null}
+          <Card>
+            <BlockStack gap="200">
               <Text variant="headingMd" as="h2">
-                Log in
+                Open Amend from your Shopify admin
               </Text>
-              <TextField
-                type="text"
-                name="shop"
-                label="Shop domain"
-                helpText="example.myshopify.com"
-                value={shop}
-                onChange={setShop}
-                autoComplete="on"
-                error={errors.shop}
-              />
-              <Button submit>Log in</Button>
-            </FormLayout>
-          </Form>
-        </Card>
+              <Text as="p">
+                Amend is installed from the Shopify App Store. Once installed,
+                open it from Apps in your Shopify admin.
+              </Text>
+              <Text as="p">
+                <Link url="https://amendinbulk.app">amendinbulk.app</Link>
+              </Text>
+            </BlockStack>
+          </Card>
+        </BlockStack>
       </Page>
     </PolarisAppProvider>
   );
