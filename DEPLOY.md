@@ -449,3 +449,22 @@ On the dev store, against the production deploy:
 
 Undo the smoke jobs before using the store for screenshots, so the seed
 catalog stays the `verify:filters` fixture.
+
+---
+
+## 8. Known follow-ups
+
+Late webhook deliveries that can leave `Shop` wrong until the merchant next
+opens the app. Both self-correct then (a fresh session runs `afterAuth`'s plan
+sync; the settings page re-syncs). Not fixed yet.
+
+- **`app/uninstalled` delivered after a reinstall.** The handler deletes the
+  shop's sessions, marks it inactive and resets it to free — including the new
+  install's session and a plan the merchant just re-subscribed to. Fix: ignore
+  the webhook when it was triggered before the shop's latest auth (compare the
+  `X-Shopify-Triggered-At` header against a timestamp `afterAuth` records).
+- **`app_subscriptions/update` doesn't check which subscription it is about.**
+  A late CANCELLED/EXPIRED for an old subscription downgrades a shop whose
+  current subscription is active. Fix: downgrade only when the payload's
+  `admin_graphql_api_id` is the shop's current subscription, or re-read
+  `currentAppInstallation.activeSubscriptions` instead of trusting the payload.
